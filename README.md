@@ -197,13 +197,17 @@ docker run --rm --network container:ch -v "$PWD/dist:/dist:ro" -v "$PWD/scripts:
 
 ## Measured locally
 
-Measured on an M-series Mac (macOS 26), 2026-10-15. The Linux bundle ran in
-Docker containers on the same machine.
+Measured on an M-series Mac (macOS 26), 2026-10-15, over several self-test runs.
+The Linux bundles ran in Docker containers on the same machine; x86_64 ran under
+emulation, so its times are only indicative.
 
 | Bundle | Compressed | Extracted | Extract | initdb | Start to `pg_isready` | Extract to `pg_isready` |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `aarch64-apple-darwin` | 10.8 MiB | 35.0 MiB | 0.2 s | 1.3 s | 0.2 s | 1.7 s |
-| `aarch64-unknown-linux-gnu` (AlmaLinux 8) | 12.5 MiB | 54.7 MiB | 0.3 s | 1.0 s | 0.1 s | 1.4 s |
+| `aarch64-apple-darwin` | 10.8 MiB | 35.0 MiB | 0.2 s | 1.3–2.9 s | 0.2–0.3 s | 1.7–3.3 s |
+| `aarch64-unknown-linux-gnu` (AlmaLinux 8 / Ubuntu 24.04) | 12.5 MiB | 54.7 MiB | 0.3 s | 1.1–1.8 s | 0.1 s | 1.5–2.2 s |
+| `x86_64-unknown-linux-gnu` (AlmaLinux 8, emulated) | 12.3 MiB | 35.0 MiB | 0.2 s | 1.4 s | 0.2 s | 1.9 s |
+
+Most of the time goes to `initdb`; starting the server takes about 0.1–0.3 s.
 
 The Linux bundle is larger once extracted because aarch64 ELF objects are
 aligned to 64 KiB pages (needed for 64K-page kernels); that padding compresses
