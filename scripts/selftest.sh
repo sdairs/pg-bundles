@@ -269,10 +269,10 @@ else
     head -c 4 "$f" | grep -q 'ELF' || continue
     NBIN=$((NBIN + 1))
     rel="${f#"$P"/}"
-    for n in $(elf_needed "$f"); do
+    for n in $(elf_needed "$f" || true); do
       if [[ "$n" =~ $ALLOWED_RE ]]; then :; elif [ -e "$P/lib/$n" ]; then :; else bad "$rel NEEDED $n"; fi
     done
-    for rp in $(elf_rpath "$f" | tr ':' ' '); do
+    for rp in $(elf_rpath "$f" | tr ':' ' ' || true); do
       case "$rp" in '$ORIGIN'|'$ORIGIN/'*) ;; *) bad "$rel RPATH/RUNPATH $rp" ;; esac
     done
     if command -v ldd >/dev/null; then
@@ -285,7 +285,7 @@ else
       done < <(ldd "$f" 2>/dev/null | sed 's/^[[:space:]]*//' | grep -v 'statically linked' || true)
     fi
     if command -v objdump >/dev/null; then
-      v="$(objdump -T "$f" 2>/dev/null | grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' | sort -t. -k1,1n -k2,2n | tail -1)"
+      v="$(objdump -T "$f" 2>/dev/null | grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' | sort -t. -k1,1n -k2,2n | tail -1 || true)"
       if [ -n "$v" ] && [ "$(printf '%s\n%s\n' "$v" "$MAXGLIBC" | sort -t. -k1,1n -k2,2n | tail -1)" = "$v" ]; then MAXGLIBC="$v"; fi
     fi
   done < <(find "$P/bin" "$P/lib" -type f -print0)
@@ -296,7 +296,7 @@ else
   fi
   echo "NEEDED closure of all bundle ELF files:"
   find "$P/bin" "$P/lib" -type f -print0 | while IFS= read -r -d '' f; do
-    head -c 4 "$f" | grep -q ELF && elf_needed "$f"; done | sort | uniq -c | sort -rn
+    if head -c 4 "$f" | grep -q ELF; then elf_needed "$f"; fi; done | sort | uniq -c | sort -rn
 fi
 [ "$BAD" = 0 ] || fail "dependency closure contains disallowed libraries"
 ok "$NBIN binaries checked, only system libraries and bundled libs"

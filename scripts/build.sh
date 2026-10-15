@@ -187,9 +187,9 @@ build_curl() {
       --with-openssl="$DEPS" --without-ca-bundle --without-ca-path --with-ca-fallback \
       --without-zlib --without-brotli --without-zstd --without-libpsl --without-libidn2 \
       --without-nghttp2 --without-nghttp3 --without-ngtcp2 --without-libssh2 \
-      --without-libssh --without-librtmp --without-libgsasl --without-apple-idn \
+      --without-libssh --without-libgsasl --without-apple-idn \
       --disable-ldap --disable-ldaps --disable-rtsp --disable-dict --disable-telnet \
-      --disable-tftp --disable-pop3 --disable-imap --disable-smb --disable-smtp \
+      --disable-tftp --disable-pop3 --disable-imap --disable-smtp \
       --disable-gopher --disable-mqtt --disable-ftp --disable-file --disable-ipfs \
       --disable-websockets --disable-manual --disable-docs --disable-ntlm \
       --disable-kerberos-auth --disable-negotiate-auth --disable-aws \
@@ -242,14 +242,6 @@ build_postgres() {
   local s="postgresql-$PG_VERSION"; done_p "$s" && return
   log "building $s"
   local d; d="$(unpack "$PG_URL" "$PG_SHA256" "$s")"
-  # libpq's build refuses any reference to a symbol containing "exit". Statically
-  # linked OpenSSL references atexit() and pthread_exit() (cleanup handlers and
-  # its thread code), neither of which exits the process. Upstream skips this
-  # check for statically linked infrastructure on some platforms already; widen
-  # its allow-list instead of disabling it.
-  sed -i.orig -e 's/grep -v -e __cxa_atexit -e __tsan_func_exit/grep -v -e atexit -e pthread_exit -e __tsan_func_exit/' \
-    "$d/src/interfaces/libpq/Makefile"
-  grep -q 'grep -v -e atexit -e pthread_exit' "$d/src/interfaces/libpq/Makefile" || die "libpq Makefile patch failed"
   (cd "$d" && \
     LZ4_CFLAGS="-I$DEPS/include" LZ4_LIBS="-L$DEPS/lib -llz4" \
     ZSTD_CFLAGS="-I$DEPS/include" ZSTD_LIBS="-L$DEPS/lib -lzstd" \
