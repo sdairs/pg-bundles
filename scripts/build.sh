@@ -284,8 +284,8 @@ EOF
 }
 
 # ------------------------------------------------------------- packaging ----
-is_macho() { file -b "$1" | grep -q '^Mach-O'; }
-is_elf()   { file -b "$1" | grep -q '^ELF'; }
+is_macho() { file -b "$1" | grep '^Mach-O' >/dev/null; }
+is_elf()   { file -b "$1" | grep '^ELF' >/dev/null; }
 
 # Relative path from directory $1 to bundle lib/ (both inside $PKG).
 rel_to_lib() {
@@ -301,7 +301,7 @@ fix_macho() {
   local f="$1" dir rel changed=0 dep base
   dir="$(dirname "$f")"; rel="$(rel_to_lib "$dir")"
   strip -x "$f" 2>/dev/null || true
-  if [ "$(dirname "$f")" = "$PKG/lib" ] && file -b "$f" | grep -q 'dynamically linked shared library'; then
+  if [ "$(dirname "$f")" = "$PKG/lib" ] && file -b "$f" | grep 'dynamically linked shared library' >/dev/null; then
     install_name_tool -id "@rpath/$(basename "$f")" "$f" 2>/dev/null
   fi
   # Rewrite every non-system dependency to @rpath/<basename>; it must be bundled.
@@ -319,9 +319,9 @@ fix_macho() {
   while read -r rp; do
     case "$rp" in @*) ;; *) install_name_tool -delete_rpath "$rp" "$f" 2>/dev/null ;; esac
   done < <(otool -l "$f" | awk '/cmd LC_RPATH/{getline; getline; print $2}')
-  if otool -L "$f" | tail -n +2 | grep -q '@rpath/'; then
+  if otool -L "$f" | tail -n +2 | grep '@rpath/' >/dev/null; then
     local want="@loader_path/$rel"; [ "$rel" = . ] && want="@loader_path"
-    otool -l "$f" | awk '/cmd LC_RPATH/{getline; getline; print $2}' | grep -qx "$want" \
+    otool -l "$f" | awk '/cmd LC_RPATH/{getline; getline; print $2}' | grep -x "$want" >/dev/null \
       || install_name_tool -add_rpath "$want" "$f" 2>/dev/null
   fi
   : "$changed"
@@ -351,9 +351,9 @@ check_elf_undefined() {
   local so="$PKG/lib/postgresql/pg_clickhouse.so" bad n
   bad="$(nm -D --undefined-only "$so" | awk '$1 == "U" {print $2}' \
         | grep -E '^(curl_|Curl_|uuid_)' || true)"
-  [ -z "$bad" ] || die "pg_clickhouse.so has unresolved statically linked symbols: $(echo "$bad" | head -5 | tr '\n' ' ')"
+  [ -z "$bad" ] || die "pg_clickhouse.so has unresolved statically linked symbols: $(echo "$bad" | sed -n 1,5p | tr '\n' ' ')"
   for n in libssl.so.3 libcrypto.so.3 liblz4.so.1 libzstd.so.1; do
-    patchelf --print-needed "$so" | grep -qx "$n" || die "pg_clickhouse.so does not link $n"
+    patchelf --print-needed "$so" | grep -x "$n" >/dev/null || die "pg_clickhouse.so does not link $n"
   done
 }
 
@@ -409,7 +409,7 @@ package() {
   local platform_json
   if [ "$OS" = Linux ]; then
     deps_json="$deps_json, \"zlib\": \"$ZLIB_VERSION\", \"libedit\": \"$LIBEDIT_VERSION\", \"ncurses\": \"$NCURSES_VERSION\", \"libuuid\": \"util-linux $UTIL_LINUX_VERSION\""
-    platform_json="\"min_glibc\": \"$(ldd --version | head -1 | awk '{print $NF}')\""
+    platform_json="\"min_glibc\": \"$(ldd --version | sed -n 1p | awk '{print $NF}')\""
   else
     platform_json="\"min_macos\": \"$MACOSX_DEPLOYMENT_TARGET\""
   fi
@@ -428,7 +428,7 @@ EOF
 
   local tgz="$DIST/$NAME.tar.gz"
   rm -f "$tgz" "$tgz.sha256"
-  if tar --version 2>/dev/null | grep -q 'GNU tar'; then
+  if tar --version 2>/dev/null | grep 'GNU tar' >/dev/null; then
     tar -C "$PKG_ROOT" --owner=0 --group=0 --numeric-owner --sort=name -cf - "$NAME" | gzip -9n >"$tgz"
   else
     COPYFILE_DISABLE=1 tar -C "$PKG_ROOT" --uid 0 --gid 0 --no-xattrs --no-mac-metadata -cf - "$NAME" | gzip -9n >"$tgz"

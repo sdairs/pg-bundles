@@ -139,7 +139,7 @@ run "${PSQL[@]}" -Atc 'SELECT version();'
 run "${PSQL[@]}" -qc 'CREATE EXTENSION pg_clickhouse;'
 DX="$(run "${PSQL[@]}" -c '\dx')"
 printf '%s\n' "$DX"
-printf '%s\n' "$DX" | grep -q 'pg_clickhouse' || fail "\\dx does not list pg_clickhouse"
+printf '%s\n' "$DX" | grep 'pg_clickhouse' >/dev/null || fail "\\dx does not list pg_clickhouse"
 EXT_VER="$(run "${PSQL[@]}" -Atc "SELECT extversion FROM pg_extension WHERE extname = 'pg_clickhouse';")"
 ok "pg_clickhouse extension version $EXT_VER"
 # Unix-socket connection in the bundle's own temp dir, too.
@@ -213,11 +213,11 @@ bad() { printf 'disallowed: %s\n' "$*" >&2; BAD=1; }
 NBIN=0
 if [ "$OS" = Darwin ]; then
   while IFS= read -r -d '' f; do
-    file -b "$f" | grep -q '^Mach-O' || continue
+    file -b "$f" | grep '^Mach-O' >/dev/null || continue
     NBIN=$((NBIN + 1))
     rel="${f#"$P"/}"
     # Load commands: LC_ID_DYLIB (first line for dylibs) is skipped.
-    skip_id=0; file -b "$f" | grep -q 'shared library' && skip_id=1
+    skip_id=0; file -b "$f" | grep 'shared library' >/dev/null && skip_id=1
     while read -r dep; do
       if [ $skip_id = 1 ]; then skip_id=0; continue; fi
       case "$dep" in
@@ -248,7 +248,7 @@ if [ "$OS" = Darwin ]; then
       *) bad "runtime load of $img" ;;
     esac
   done <<<"$LOADED"
-  printf '%s\n' "$LOADED" | grep -q 'pg_clickhouse.dylib' || bad "pg_clickhouse.dylib was never loaded"
+  printf '%s\n' "$LOADED" | grep 'pg_clickhouse.dylib' >/dev/null || bad "pg_clickhouse.dylib was never loaded"
   echo "runtime images loaded by postgres: $(printf '%s\n' "$LOADED" | wc -l | tr -d ' ') (all bundle/system)"
   echo "otool closure of all bundle Mach-O files:"
   find "$P/bin" "$P/lib" -type f -exec otool -L {} + 2>/dev/null | awk '/^\t/{print $1}' \
@@ -266,7 +266,7 @@ else
   fi
   MAXGLIBC=0.0
   while IFS= read -r -d '' f; do
-    head -c 4 "$f" | grep -q 'ELF' || continue
+    head -c 4 "$f" | grep 'ELF' >/dev/null || continue
     NBIN=$((NBIN + 1))
     rel="${f#"$P"/}"
     for n in $(elf_needed "$f" || true); do
@@ -296,7 +296,7 @@ else
   fi
   echo "NEEDED closure of all bundle ELF files:"
   find "$P/bin" "$P/lib" -type f -print0 | while IFS= read -r -d '' f; do
-    if head -c 4 "$f" | grep -q ELF; then elf_needed "$f"; fi; done | sort | uniq -c | sort -rn
+    if head -c 4 "$f" | grep ELF >/dev/null; then elf_needed "$f"; fi; done | sort | uniq -c | sort -rn
 fi
 [ "$BAD" = 0 ] || fail "dependency closure contains disallowed libraries"
 ok "$NBIN binaries checked, only system libraries and bundled libs"
