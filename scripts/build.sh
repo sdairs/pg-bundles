@@ -9,6 +9,7 @@
 #   PGB_KEEP_INCLUDE=1 keep include/ and lib/postgresql/pgxs (headers for building
 #                      more extensions against the bundle); dropped by default
 #   PGB_COMMIT=<sha>   commit recorded in BUNDLE.json (default: git rev-parse HEAD)
+#   PGB_DIRTY=1        with PGB_COMMIT: mark the commit as having local changes
 #   PGB_REPO=<o/r>     repo recorded in BUNDLE.json (default: $GITHUB_REPOSITORY or sdairs/pg-bundles)
 #
 # Linux bundles are meant to be built inside the glibc 2.28 container via
@@ -94,6 +95,9 @@ else
   # Debian/Ubuntu/Alpine/Arch keep hashed CA certs in /etc/ssl/certs. Other
   # distros can point OpenSSL at their bundle with SSL_CERT_FILE / SSL_CERT_DIR.
   OPENSSL_DIR=/etc/ssl
+  # configure run-tests and build-time tools must find the shared OpenSSL/lz4/
+  # zstd in the deps prefix; the shipped binaries get $ORIGIN RUNPATHs instead.
+  export LD_LIBRARY_PATH="$DEPS/lib"
 fi
 DEP_CFLAGS="-O2 -fPIC"
 
@@ -132,7 +136,10 @@ unpack() { # unpack <url> <sha256> <dirname> -> fresh extracted dir
 done_p() { [ -f "$STAMPS/$1" ]; }
 mark()   { touch "$STAMPS/$1"; }
 
-# ----------------------------------------------------------- static deps ----
+# ------------------------------------------------------------------ deps ----
+# OpenSSL, lz4 and zstd are shared libraries shipped in the bundle's lib/ (they
+# are used by many binaries). zlib, libedit, ncurses, libuuid and curl have one
+# or two consumers each and are linked statically.
 build_zlib() {
   local s="zlib-$ZLIB_VERSION"; done_p "$s" && return
   log "building $s"; local d; d="$(unpack "$ZLIB_URL" "$ZLIB_SHA256" "$s")"
@@ -145,26 +152,29 @@ build_openssl() {
   local s="openssl-$OPENSSL_VERSION"; done_p "$s" && return
   log "building $s ($OPENSSL_PLATFORM, openssldir=$OPENSSL_DIR)"
   local d; d="$(unpack "$OPENSSL_URL" "$OPENSSL_SHA256" "$s")"
+  # Shared: libcrypto is used by postgres, libpq, pg_dump & co, pgcrypto,
+  # sslinfo and pg_clickhouse; static linking would copy it into each of them.
   (cd "$d" && ./Configure "$OPENSSL_PLATFORM" --prefix="$DEPS" --libdir=lib \
-      --openssldir="$OPENSSL_DIR" no-shared no-module no-tests no-docs no-apps \
-      no-legacy -fPIC >/dev/null \
+      --openssldir="$OPENSSL_DIR" shared no-module no-tests no-docs no-apps \
+      no-legacy >/dev/null \
     && make -j"$JOBS" build_libs >/dev/null && make install_dev >/dev/null)
+  rm -f "$DEPS/lib/libssl.a" "$DEPS/lib/libcrypto.a"
   mark "$s"
 }
 
 build_lz4() {
   local s="lz4-$LZ4_VERSION"; done_p "$s" && return
   log "building $s"; local d; d="$(unpack "$LZ4_URL" "$LZ4_SHA256" "$s")"
-  (cd "$d" && make -C lib -j"$JOBS" liblz4.a CFLAGS="$DEP_CFLAGS" >/dev/null \
-    && make -C lib install PREFIX="$DEPS" BUILD_SHARED=no >/dev/null)
+  (cd "$d" && make -C lib -j"$JOBS" lib PREFIX="$DEPS" CFLAGS="$DEP_CFLAGS" >/dev/null \
+    && make -C lib install PREFIX="$DEPS" BUILD_STATIC=no >/dev/null)
   mark "$s"
 }
 
 build_zstd() {
   local s="zstd-$ZSTD_VERSION"; done_p "$s" && return
   log "building $s"; local d; d="$(unpack "$ZSTD_URL" "$ZSTD_SHA256" "$s")"
-  (cd "$d" && make -C lib -j"$JOBS" libzstd.a CFLAGS="$DEP_CFLAGS" >/dev/null \
-    && make -C lib install-static install-includes install-pc PREFIX="$DEPS" >/dev/null)
+  (cd "$d" && make -C lib -j"$JOBS" libzstd PREFIX="$DEPS" CFLAGS="$DEP_CFLAGS" >/dev/null \
+    && make -C lib install-shared install-includes install-pc PREFIX="$DEPS" >/dev/null)
   mark "$s"
 }
 
@@ -206,7 +216,7 @@ build_ncurses() {
   (cd "$d" && CFLAGS="$DEP_CFLAGS" ./configure --prefix="$DEPS" --without-shared \
       --without-debug --without-cxx --without-cxx-binding --without-ada \
       --without-manpages --without-progs --without-tests --disable-db-install \
-      --enable-widec --disable-pc-files \
+      --disable-widec --disable-pc-files \
       --with-default-terminfo-dir=/usr/share/terminfo \
       --with-terminfo-dirs=/etc/terminfo:/lib/terminfo:/usr/share/terminfo:/usr/lib/terminfo \
       >/dev/null \
@@ -217,8 +227,8 @@ build_ncurses() {
 build_libedit() {
   local s="libedit-$LIBEDIT_VERSION"; done_p "$s" && return
   log "building $s"; local d; d="$(unpack "$LIBEDIT_URL" "$LIBEDIT_SHA256" "$s")"
-  (cd "$d" && CFLAGS="$DEP_CFLAGS" CPPFLAGS="-I$DEPS/include -I$DEPS/include/ncursesw" \
-      LDFLAGS="-L$DEPS/lib" LIBS="-lncursesw" ./configure --prefix="$DEPS" \
+  (cd "$d" && CFLAGS="$DEP_CFLAGS" CPPFLAGS="-I$DEPS/include -I$DEPS/include/ncurses" \
+      LDFLAGS="-L$DEPS/lib" ./configure --prefix="$DEPS" \
       --disable-shared --enable-static --disable-examples >/dev/null \
     && make -j"$JOBS" >/dev/null && make install >/dev/null)
   mark "$s"
@@ -344,11 +354,15 @@ fix_elf() {
 check_elf_undefined() {
   # Static archives are order-sensitive with GNU ld; a shared object linked in
   # the wrong order still links (undefined symbols are allowed) but fails at
-  # load time. Make sure pg_clickhouse resolved its third-party symbols.
-  local so="$PKG/lib/postgresql/pg_clickhouse.so" bad
-  bad="$(nm -D --undefined-only "$so" | awk '{print $2}' \
-        | grep -E '^(SSL_|OPENSSL_|EVP_|ERR_|X509_|BIO_|curl_|Curl_|LZ4_|ZSTD_|uuid_)' || true)"
-  [ -z "$bad" ] || die "pg_clickhouse.so has unresolved bundled-library symbols: $(echo "$bad" | head -5 | tr '\n' ' ')"
+  # load time. Make sure pg_clickhouse resolved its statically linked curl and
+  # libuuid, and links the bundled shared OpenSSL/lz4/zstd.
+  local so="$PKG/lib/postgresql/pg_clickhouse.so" bad n
+  bad="$(nm -D --undefined-only "$so" | awk '$1 == "U" {print $2}' \
+        | grep -E '^(curl_|Curl_|uuid_)' || true)"
+  [ -z "$bad" ] || die "pg_clickhouse.so has unresolved statically linked symbols: $(echo "$bad" | head -5 | tr '\n' ' ')"
+  for n in libssl.so.3 libcrypto.so.3 liblz4.so.1 libzstd.so.1; do
+    patchelf --print-needed "$so" | grep -qx "$n" || die "pg_clickhouse.so does not link $n"
+  done
 }
 
 json_list() { local first=1 x; printf '['; for x in "$@"; do [ $first = 1 ] || printf ', '; first=0; printf '"%s"' "$x"; done; printf ']'; }
@@ -362,6 +376,11 @@ package() {
   fi
   rm -rf "$PKG/lib/pkgconfig"
   find "$PKG/lib" -maxdepth 1 -name '*.a' -delete
+  # Shared dependencies (and their version symlinks).
+  local pat
+  for pat in 'libssl.*' 'libcrypto.*' 'liblz4.*' 'libzstd.*'; do
+    find "$DEPS/lib" -maxdepth 1 -name "$pat" \( -name '*.so*' -o -name '*.dylib' \) -exec cp -a {} "$PKG/lib/" \;
+  done
 
   # Licences of everything statically linked into the bundle.
   local lic="$PKG/share/licenses"; mkdir -p "$lic"
@@ -388,7 +407,9 @@ package() {
 
   local commit repo dirty="" deps_json
   commit="${PGB_COMMIT:-$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || echo unknown)}"
-  if [ -z "${PGB_COMMIT:-}" ] && [ -n "$(git -C "$ROOT" status --porcelain --untracked-files=no 2>/dev/null)" ]; then
+  if [ -n "${PGB_COMMIT:-}" ]; then
+    [ "${PGB_DIRTY:-0}" = 1 ] && dirty=", \"dirty\": true"
+  elif [ -n "$(git -C "$ROOT" status --porcelain --untracked-files=no 2>/dev/null)" ]; then
     dirty=", \"dirty\": true"
   fi
   repo="${PGB_REPO:-${GITHUB_REPOSITORY:-sdairs/pg-bundles}}"

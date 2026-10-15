@@ -1,0 +1,176 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+jobs:
+  linux:
+    name: ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            arch: x86_64
+            runner: ubuntu-24.04
+          - target: aarch64-unknown-linux-gnu
+            arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    services:
+      clickhouse:
+        image: clickhouse/clickhouse-server:26.8@sha256:bc1a1d93355508c1414bb692e6e56972b492dad55a7891cb63c6e6f1b9697236
+        ports:
+          - 8123:8123
+          - 9000:9000
+        env:
+          CLICKHOUSE_SKIP_USER_SETUP: "1"
+        options: >-
+          --ulimit nofile=262144:262144
+          --health-cmd "wget -qO- http://127.0.0.1:8123/ping || exit 1"
+          --health-interval 2s --health-timeout 2s --health-retries 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Cache sources
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .build/sources
+          key: sources-${{ hashFiles('scripts/versions.env') }}
+
+      - name: Build in manylinux_2_28 (glibc 2.28) container
+        run: scripts/build-linux.sh "${{ matrix.arch }}"
+
+      - name: Self-test (host glibc, ClickHouse service container)
+        env:
+          CLICKHOUSE_HOST: 127.0.0.1
+          CLICKHOUSE_HTTP_PORT: "8123"
+          CLICKHOUSE_NATIVE_PORT: "9000"
+          PGB_SELFTEST_CLICKHOUSE: require
+        run: |
+          tgz=$(ls dist/*-${{ matrix.target }}.tar.gz)
+          PGB_SELFTEST_REPORT="${tgz%.tar.gz}.selftest.json" scripts/selftest.sh "$tgz" | tee selftest.log
+          { echo '### ${{ matrix.target }}'; echo '```'; sed -n '/^--- summary/,$p' selftest.log; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: bundle-${{ matrix.target }}
+          path: |
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
+            dist/*.selftest.json
+          if-no-files-found: error
+
+  macos:
+    name: ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            runner: macos-15
+          - target: x86_64-apple-darwin
+            runner: macos-15-intel
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Cache sources
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .build/sources
+          key: sources-${{ hashFiles('scripts/versions.env') }}
+
+      - name: Build
+        run: scripts/build.sh
+
+      # macOS runners have no service containers; run a pinned ClickHouse
+      # release binary natively instead.
+      - name: Start ClickHouse (native binary)
+        id: clickhouse
+        run: echo "pid=$(scripts/start-clickhouse-macos.sh)" >> "$GITHUB_OUTPUT"
+
+      - name: Self-test
+        env:
+          CLICKHOUSE_HOST: 127.0.0.1
+          CLICKHOUSE_HTTP_PORT: "8123"
+          CLICKHOUSE_NATIVE_PORT: "9000"
+          PGB_SELFTEST_CLICKHOUSE: require
+        run: |
+          tgz=$(ls dist/*-${{ matrix.target }}.tar.gz)
+          PGB_SELFTEST_REPORT="${tgz%.tar.gz}.selftest.json" scripts/selftest.sh "$tgz" | tee selftest.log
+          { echo '### ${{ matrix.target }}'; echo '```'; sed -n '/^--- summary/,$p' selftest.log; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Stop ClickHouse
+        if: always() && steps.clickhouse.outputs.pid != ''
+        run: kill "${{ steps.clickhouse.outputs.pid }}" || true
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: bundle-${{ matrix.target }}
+          path: |
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
+            dist/*.selftest.json
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [linux, macos]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: bundle-*
+          path: dist
+          merge-multiple: true
+
+      - name: Release notes
+        run: |
+          . scripts/versions.env
+          {
+            echo "PostgreSQL ${PG_VERSION} with pg_clickhouse ${PGCH_VERSION}, built from ${GITHUB_SHA}."
+            echo
+            echo "OpenSSL ${OPENSSL_VERSION}, curl ${CURL_VERSION}, lz4 ${LZ4_VERSION}, zstd ${ZSTD_VERSION}; Linux builds target glibc 2.28."
+            echo "Self-test timings were measured on GitHub-hosted runners (extract, initdb, start, wait for pg_isready)."
+            echo
+            echo "| Bundle | Compressed | Extracted | Extract to pg_isready | Start to pg_isready | ClickHouse query |"
+            echo "| --- | ---: | ---: | ---: | ---: | --- |"
+            for f in dist/*.selftest.json; do
+              jq -r '"| `\(.bundle)` | \(.compressed_bytes/1048576*10|round/10) MiB | \(.extracted_bytes/1048576*10|round/10) MiB | \(.extract_to_ready_ms) ms | \(.start_ms) ms | \(.clickhouse) |"' "$f"
+            done
+            echo
+            echo "Verify a download with \`shasum -a 256 -c <bundle>.tar.gz.sha256\`."
+          } > notes.md
+          cat notes.md
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --title "$TAG" --notes-file notes.md \
+            dist/*.tar.gz dist/*.tar.gz.sha256

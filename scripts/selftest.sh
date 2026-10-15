@@ -84,8 +84,8 @@ printf '%s\n' "$PGPASS" >"$TMP/pwfile"
 chmod 600 "$TMP/pwfile"
 
 free_port() {
-  local p i
-  for i in $(seq 1 50); do
+  local p
+  for _ in $(seq 1 50); do
     p=$(( 20000 + (RANDOM * 32768 + RANDOM) % 40000 ))
     if ! (exec 3<>"/dev/tcp/127.0.0.1/$p") 2>/dev/null; then echo "$p"; return; fi
   done
@@ -117,7 +117,7 @@ PRELOAD_ENV=()
 # backends, so step 6 can check what was actually loaded at runtime, including
 # pg_clickhouse.dylib and everything it pulls in.
 [ "$OS" = Darwin ] && PRELOAD_ENV=(DYLD_PRINT_LIBRARIES=1)
-env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin HOME="${HOME:-/tmp}" LANG=C LC_ALL=C TZ=UTC "${PRELOAD_ENV[@]}" \
+env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin HOME="${HOME:-/tmp}" LANG=C LC_ALL=C TZ=UTC ${PRELOAD_ENV[@]+"${PRELOAD_ENV[@]}"} \
   "$P/bin/postgres" -D "$TMP/data" -p "$PORT" -k "$TMP/sock" -c listen_addresses=127.0.0.1 \
   >"$TMP/postgres.log" 2>&1 &
 PG_PID=$!
