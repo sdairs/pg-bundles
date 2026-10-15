@@ -146,9 +146,9 @@ GitHub Actions in this repo:
 - Runs the self-test, then on a tag (`v*`) creates a GitHub release with every tarball + `.sha256`.
 - Pin actions to commit SHAs (same rule as clickhousectl).
 
-Note: this repo is **private**, so release assets need an authenticated download (`gh release download` or
-`Authorization: Bearer $GITHUB_TOKEN`). The `chctl` prototype must therefore accept a local file as well as
-a URL.
+Note: this repo is **public**, so release assets download without authentication, e.g.
+`https://github.com/sdairs/pg-bundles/releases/download/<tag>/<bundle>.tar.gz`. The `chctl` prototype should
+still accept a local file as well as a URL (for testing unreleased builds).
 
 ## clickhousectl prototype (separate repo, draft branch)
 
@@ -158,8 +158,8 @@ Read that repo's `AGENTS.md` first.
 Opt-in only; default behaviour stays Docker:
 
 - `CLICKHOUSECTL_PG_RUNTIME=native` selects the native backend.
-- `CLICKHOUSECTL_PG_BUNDLE=<https URL | file:///path/to/bundle.tar.gz>` points at the bundle. For an https URL
-  to this private repo, send `GITHUB_TOKEN` if set.
+- `CLICKHOUSECTL_PG_BUNDLE=<https URL | file:///path/to/bundle.tar.gz>` points at the bundle. Release assets
+  of this public repo need no authentication.
 
 Behaviour of the native backend:
 
