@@ -130,18 +130,28 @@ if [ "$OS" = Darwin ]; then
 fi
 
 # ---------------------------------------------------------------- helpers ----
-fetch() { # fetch <url> <sha256> -> path of verified file in the cache
-  local url="$1" want="$2" file
-  file="$SRC_CACHE/$(basename "$url")"
+fetch() { # fetch "<url> [<mirror-url>...]" <sha256> -> path of verified file in the cache
+  local urls="$1" want="$2" file url got
+  # shellcheck disable=SC2086 # the URL list is space-separated on purpose
+  set -- $urls
+  file="$SRC_CACHE/$(basename "$1")"
   if [ -f "$file" ] && [ "$(sha256 "$file" | cut -d' ' -f1)" = "$want" ]; then
     printf '%s\n' "$file"; return
   fi
-  log "downloading $url"
-  curl -fsSL --retry 3 -o "$file.part" "$url"
-  local got; got="$(sha256 "$file.part" | cut -d' ' -f1)"
-  [ "$got" = "$want" ] || { rm -f "$file.part"; die "sha256 mismatch for $url: got $got want $want"; }
-  mv "$file.part" "$file"
-  printf '%s\n' "$file"
+  for url in "$@"; do
+    log "downloading $url"
+    rm -f "$file.part"
+    if ! curl -fsSL --retry 5 --retry-delay 3 --connect-timeout 30 -o "$file.part" "$url"; then
+      log "download failed: $url"; continue
+    fi
+    got="$(sha256 "$file.part" | cut -d' ' -f1)"
+    if [ "$got" = "$want" ]; then
+      mv "$file.part" "$file"; printf '%s\n' "$file"; return
+    fi
+    log "sha256 mismatch for $url: got $got want $want"
+  done
+  rm -f "$file.part"
+  die "could not download a file with sha256 $want from: $urls"
 }
 
 unpack() { # unpack <url> <sha256> <dirname> [<parent>] -> fresh extracted dir

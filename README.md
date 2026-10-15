@@ -306,8 +306,10 @@ Sizes are what the self-test measured after extraction.
 | `pg-17.11-…-aarch64-unknown-linux-gnu` | 12.1 MiB | 40.9 MiB | CentOS 7, Debian 10, Ubuntu 24.04 | 1.1–2.3 s | 0.1 s | 1.4–2.7 s |
 
 Most of the time goes to `initdb`; starting the server takes about 0.1–0.3 s.
-CI measures the x86_64 bundles on GitHub-hosted runners; see the job summaries
-and release notes.
+`pg-18.6-…-x86_64-apple-darwin` (11.4 MiB / 34.1 MiB, minos 10.13) was also
+built and self-tested here under Rosetta. CI measures the x86_64 bundles on
+GitHub-hosted runners (Intel macOS 15, Ubuntu 24.04 and the distro
+containers); see the job summaries and release notes.
 
 The Linux bundles are larger once extracted because aarch64 ELF objects are
 aligned to 64 KiB pages (needed for 64K-page kernels); that padding compresses

@@ -66,6 +66,8 @@ jobs:
         with:
           path: .build/sources
           key: sources-pg${{ matrix.pg }}-${{ matrix.libc }}-${{ hashFiles('scripts/versions.env') }}
+          restore-keys: |
+            sources-
 
       - name: Build (manylinux2014 for gnu, Alpine for musl)
         run: scripts/build-linux.sh "${{ matrix.arch }}" "${{ matrix.libc }}"
@@ -131,6 +133,8 @@ jobs:
         with:
           path: .build/sources
           key: sources-pg${{ matrix.pg }}-macos-${{ hashFiles('scripts/versions.env') }}
+          restore-keys: |
+            sources-
 
       - name: Build
         run: scripts/build.sh
