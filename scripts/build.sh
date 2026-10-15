@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 # Build a relocatable PostgreSQL + pg_clickhouse bundle for the host platform.
 #
-#   scripts/build.sh            # build for the host, write dist/<name>.tar.gz(+.sha256)
+#   scripts/build.sh                 # PostgreSQL 18 for the host, write dist/<name>.tar.gz(+.sha256)
+#   PG_MAJOR=17 scripts/build.sh     # PostgreSQL 17
 #
 # Environment:
+#   PG_MAJOR=<17|18>   PostgreSQL major to build (default 18; versions in versions.env)
 #   JOBS=<n>           parallel make jobs (default: CPU count)
 #   PGB_CLEAN=1        wipe the per-target build tree first (sources cache is kept)
 #   PGB_KEEP_INCLUDE=1 keep include/ and lib/postgresql/pgxs (headers for building
@@ -12,16 +14,20 @@
 #   PGB_DIRTY=1        with PGB_COMMIT: mark the commit as having local changes
 #   PGB_REPO=<o/r>     repo recorded in BUNDLE.json (default: $GITHUB_REPOSITORY or sdairs/pg-bundles)
 #
-# Linux bundles are meant to be built inside the glibc 2.28 container via
-# scripts/build-linux.sh, which calls this script.
+# Linux bundles are meant to be built inside a container via
+# scripts/build-linux.sh, which calls this script: manylinux2014 (glibc 2.17)
+# for *-unknown-linux-gnu, Alpine for *-unknown-linux-musl. On a musl host
+# (/lib/ld-musl-<arch>.so.1 exists) the target is *-unknown-linux-musl.
 #
 # Layout of the cache (all under .build/, gitignored):
-#   .build/sources/                 verified source downloads, shared by all targets
-#   .build/<target>/src/            extracted sources
-#   .build/<target>/deps/           static dependency prefix (never shipped)
-#   .build/<target>/stage/pgbundle  PostgreSQL installed with DESTDIR (prefix=/pgbundle)
-#   .build/<target>/pkg/<name>/     the bundle tree that gets tarred
-#   .build/<target>/stamps/         one stamp per completed step, keyed by version
+#   .build/sources/                     verified source downloads, shared by all targets
+#   .build/<target>/src/                extracted dependency sources
+#   .build/<target>/deps/               dependency prefix (never shipped as a whole)
+#   .build/<target>/stamps/             one stamp per completed dependency step
+#   .build/<target>/pg-<ver>/src/       PostgreSQL and pg_clickhouse sources
+#   .build/<target>/pg-<ver>/stage/pgbundle  PostgreSQL installed with DESTDIR (prefix=/pgbundle)
+#   .build/<target>/pg-<ver>/pkg/<name>/     the bundle tree that gets tarred
+#   .build/<target>/pg-<ver>/stamps/    stamps for the PostgreSQL / pg_clickhouse steps
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -34,11 +40,16 @@ die() { printf 'error: %s\n' "$*" >&2; exit 1; }
 # ---------------------------------------------------------------- target ----
 OS="$(uname -s)"
 ARCH="$(uname -m)"
+LIBC=""
+if [ "$OS" = Linux ]; then
+  LIBC=gnu
+  [ -e "/lib/ld-musl-$ARCH.so.1" ] && LIBC=musl
+fi
 case "$OS/$ARCH" in
   Darwin/arm64)   TARGET=aarch64-apple-darwin ;;
   Darwin/x86_64)  TARGET=x86_64-apple-darwin ;;
-  Linux/x86_64)   TARGET=x86_64-unknown-linux-gnu ;;
-  Linux/aarch64)  TARGET=aarch64-unknown-linux-gnu ;;
+  Linux/x86_64)   TARGET=x86_64-unknown-linux-$LIBC ;;
+  Linux/aarch64)  TARGET=aarch64-unknown-linux-$LIBC ;;
   *) die "unsupported host $OS/$ARCH" ;;
 esac
 # Cross builds are not supported; TARGET may only restate the host target.
@@ -56,20 +67,24 @@ NAME="pg-${PG_VERSION}-pgch-${PGCH_VERSION}-${TARGET}"
 SRC_CACHE="$ROOT/.build/sources"
 B="$ROOT/.build/$TARGET"
 DEPS="$B/deps"
-DESTDIR_ROOT="$B/stage"
+# PostgreSQL / pg_clickhouse build trees are per PostgreSQL version, so both
+# majors can be built from the same dependency prefix without rebuilding.
+PB="$B/pg-$PG_VERSION"
+DESTDIR_ROOT="$PB/stage"
 # PostgreSQL appends "/postgresql" to share/ and lib/ only when the prefix path
 # does not already contain "postgres" or "pgsql". Install with a neutral prefix
 # via DESTDIR so the layout is always lib/postgresql + share/postgresql no matter
 # where this repo is checked out.
 PG_PREFIX=/pgbundle
 STAGE="$DESTDIR_ROOT$PG_PREFIX"
-PKG_ROOT="$B/pkg"
+PKG_ROOT="$PB/pkg"
 PKG="$PKG_ROOT/$NAME"
 STAMPS="$B/stamps"
+PG_STAMPS="$PB/stamps"
 DIST="$ROOT/dist"
 
 [ "${PGB_CLEAN:-0}" = 1 ] && { log "cleaning $B"; rm -rf "$B"; }
-mkdir -p "$SRC_CACHE" "$B/src" "$DEPS" "$STAMPS" "$DIST"
+mkdir -p "$SRC_CACHE" "$B/src" "$PB/src" "$DEPS" "$STAMPS" "$PG_STAMPS" "$DIST"
 
 # ----------------------------------------------------------- environment ----
 # Keep the build hermetic: nothing from Homebrew (or any other package manager
@@ -82,8 +97,13 @@ export PKG_CONFIG_PATH="$DEPS/lib/pkgconfig"
 
 if [ "$OS" = Darwin ]; then
   export PATH=/usr/bin:/bin:/usr/sbin:/sbin
-  export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-12.0}"
-  export CC=/usr/bin/clang
+  # Oldest macOS the bundle runs on. 11.0 is the first release for Apple
+  # silicon; 10.13 is the oldest deployment target current Xcode supports.
+  case "$ARCH" in arm64) MIN_MACOS=11.0 ;; *) MIN_MACOS=10.13 ;; esac
+  export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-$MIN_MACOS}"
+  # Explicit -arch: under Rosetta (arch -x86_64) configure's child processes
+  # would otherwise compile for arm64.
+  export CC="/usr/bin/clang -arch $ARCH"
   sha256() { shasum -a 256 "$@"; }
   OPENSSL_PLATFORM="darwin64-${ARCH}-cc"
   # /etc/ssl/cert.pem is the system CA bundle on macOS.
@@ -100,6 +120,14 @@ else
   export LD_LIBRARY_PATH="$DEPS/lib"
 fi
 DEP_CFLAGS="-O2 -fPIC"
+PG_CFLAGS="-O2"
+if [ "$OS" = Darwin ]; then
+  # Fail the build (and configure checks) on any use of an API newer than the
+  # deployment target that is not guarded by an availability check; otherwise
+  # such a symbol links fine and only fails at load time on an older macOS.
+  DEP_CFLAGS="$DEP_CFLAGS -Werror=unguarded-availability-new"
+  PG_CFLAGS="$PG_CFLAGS -Werror=unguarded-availability-new"
+fi
 
 # ---------------------------------------------------------------- helpers ----
 fetch() { # fetch <url> <sha256> -> path of verified file in the cache
@@ -116,8 +144,8 @@ fetch() { # fetch <url> <sha256> -> path of verified file in the cache
   printf '%s\n' "$file"
 }
 
-unpack() { # unpack <url> <sha256> <dirname> -> fresh extracted dir
-  local archive dir="$B/src/$3"
+unpack() { # unpack <url> <sha256> <dirname> [<parent>] -> fresh extracted dir
+  local archive dir="${4:-$B/src}/$3"
   archive="$(fetch "$1" "$2")"
   rm -rf "$dir"; mkdir -p "$dir"
   case "$archive" in
@@ -135,6 +163,8 @@ unpack() { # unpack <url> <sha256> <dirname> -> fresh extracted dir
 
 done_p() { [ -f "$STAMPS/$1" ]; }
 mark()   { touch "$STAMPS/$1"; }
+pg_done_p() { [ -f "$PG_STAMPS/$1" ]; }
+pg_mark()   { touch "$PG_STAMPS/$1"; }
 
 # ------------------------------------------------------------------ deps ----
 # OpenSSL, lz4 and zstd are shared libraries shipped in the bundle's lib/ (they
@@ -239,36 +269,36 @@ PG_CONFIGURE=(--prefix="$PG_PREFIX" --with-openssl --without-icu --with-lz4 --wi
               --with-libedit-preferred --disable-rpath)
 
 build_postgres() {
-  local s="postgresql-$PG_VERSION"; done_p "$s" && return
+  local s="postgresql-$PG_VERSION"; pg_done_p "$s" && return
   log "building $s"
-  local d; d="$(unpack "$PG_URL" "$PG_SHA256" "$s")"
-  (cd "$d" && \
+  local d; d="$(unpack "$PG_URL" "$PG_SHA256" "$s" "$PB/src")"
+  (cd "$d" && CFLAGS="$PG_CFLAGS" \
     LZ4_CFLAGS="-I$DEPS/include" LZ4_LIBS="-L$DEPS/lib -llz4" \
     ZSTD_CFLAGS="-I$DEPS/include" ZSTD_LIBS="-L$DEPS/lib -lzstd" \
     ./configure "${PG_CONFIGURE[@]}" \
-      --with-includes="$DEPS/include" --with-libraries="$DEPS/lib" >"$B/pg-configure.log" 2>&1 \
-    || { tail -50 "$B/pg-configure.log"; config_log_tail "$d"; exit 1; })
+      --with-includes="$DEPS/include" --with-libraries="$DEPS/lib" >"$PB/pg-configure.log" 2>&1 \
+    || { tail -50 "$PB/pg-configure.log"; config_log_tail "$d"; exit 1; })
   log "make world-bin (-j$JOBS)"
-  (cd "$d" && make -j"$JOBS" world-bin >"$B/pg-make.log" 2>&1) || { tail -80 "$B/pg-make.log"; exit 1; }
+  (cd "$d" && make -j"$JOBS" world-bin >"$PB/pg-make.log" 2>&1) || { tail -80 "$PB/pg-make.log"; exit 1; }
   rm -rf "$DESTDIR_ROOT"
-  (cd "$d" && make install-world-bin DESTDIR="$DESTDIR_ROOT" >"$B/pg-install.log" 2>&1) \
-    || { tail -40 "$B/pg-install.log"; exit 1; }
-  rm -f "$STAMPS/pg_clickhouse-"*  # the extension must be reinstalled into a fresh stage
-  mark "$s"
+  (cd "$d" && make install-world-bin DESTDIR="$DESTDIR_ROOT" >"$PB/pg-install.log" 2>&1) \
+    || { tail -40 "$PB/pg-install.log"; exit 1; }
+  rm -f "$PG_STAMPS/pg_clickhouse-"*  # the extension must be reinstalled into a fresh stage
+  pg_mark "$s"
 }
 config_log_tail() { [ -f "$1/config.log" ] && tail -60 "$1/config.log" >&2 || true; }
 
 # --------------------------------------------------------- pg_clickhouse ----
 build_pg_clickhouse() {
-  local s="pg_clickhouse-$PGCH_VERSION"; done_p "$s" && return
-  log "building $s"
-  local d; d="$(unpack "$PGCH_URL" "$PGCH_SHA256" "$s")"
+  local s="pg_clickhouse-$PGCH_VERSION"; pg_done_p "$s" && return
+  log "building $s for PostgreSQL $PG_VERSION"
+  local d; d="$(unpack "$PGCH_URL" "$PGCH_SHA256" "$s" "$PB/src")"
   # The release zip ships the vendored submodules but no .gitmodules; give the
   # Makefile's submodule rule an old prerequisite so it never runs git.
   touch -t 200001010000 "$d/.gitmodules"
   # pg_clickhouse links `$(CURL_CONFIG) --libs`; with a static libcurl that must
   # be the static link line (curl + OpenSSL + system libs, in that order).
-  local cc="$B/curl-config-static"
+  local cc="$PB/curl-config-static"
   cat >"$cc" <<EOF
 #!/bin/sh
 case "\$1" in
@@ -278,9 +308,18 @@ esac
 EOF
   chmod +x "$cc"
   local mk=(PG_CONFIG="$STAGE/bin/pg_config" CURL_CONFIG="$cc")
-  (cd "$d" && make -j"$JOBS" "${mk[@]}" >"$B/pgch-make.log" 2>&1 && make "${mk[@]}" install >>"$B/pgch-make.log" 2>&1) \
-    || { tail -60 "$B/pgch-make.log"; exit 1; }
-  mark "$s"
+  if [ "$LIBC" = musl ]; then
+    # Alpine's GCC 15 defaults to C23, where clickhouse-c uses unreachable()
+    # from <stddef.h>, which musl's header does not define yet: build as C17.
+    # pg_clickhouse also uses -Werror -Wclobbered, and GCC 15 reports
+    # "might be clobbered" warnings GCC 10 and clang do not; CFLAGS_SL comes
+    # after the extension's -Werror on the compile line, so keep that one a
+    # warning there.
+    mk+=(COPT=-std=gnu17 CFLAGS_SL="-fPIC -Wno-error=clobbered")
+  fi
+  (cd "$d" && make -j"$JOBS" "${mk[@]}" >"$PB/pgch-make.log" 2>&1 && make "${mk[@]}" install >>"$PB/pgch-make.log" 2>&1) \
+    || { tail -60 "$PB/pgch-make.log"; exit 1; }
+  pg_mark "$s"
 }
 
 # ------------------------------------------------------------- packaging ----
@@ -290,7 +329,7 @@ is_elf()   { file -b "$1" | grep '^ELF' >/dev/null; }
 # Relative path from directory $1 to bundle lib/ (both inside $PKG).
 rel_to_lib() {
   case "${1#"$PKG"/}" in
-    bin) echo ../lib ;;
+    bin|libexec) echo ../lib ;;
     lib) echo . ;;
     lib/postgresql) echo .. ;;
     *) die "unexpected binary dir $1" ;;
@@ -357,6 +396,41 @@ check_elf_undefined() {
   done
 }
 
+# Highest GLIBC_x.y symbol version any bundled ELF file needs.
+max_glibc_symbol() {
+  find "$PKG/bin" "$PKG/lib" -type f -exec objdump -T {} + 2>/dev/null \
+    | grep -o 'GLIBC_[0-9][0-9.]*' | sed 's/GLIBC_//' | sort -t. -k1,1n -k2,2n -k3,3n | tail -1 || true
+}
+
+# musl: ship the build image's dynamic loader (which is also musl's libc) and
+# a launcher per executable.
+LDSO="ld-musl-$ARCH.so.1"
+package_musl_runtime() {
+  local v
+  v="$("/lib/$LDSO" 2>&1 | sed -n 's/^Version //p' || true)"
+  [ "$v" = "$MUSL_VERSION" ] || die "build image has musl $v, versions.env pins MUSL_VERSION=$MUSL_VERSION"
+  cp -L "/lib/$LDSO" "$PKG/lib/$LDSO"
+  chmod 755 "$PKG/lib/$LDSO"
+  local d; d="$(unpack "$MUSL_URL" "$MUSL_SHA256" "musl-$MUSL_VERSION")"
+  cp "$d/COPYRIGHT" "$PKG/share/licenses/musl.txt"
+  "$CC" -static -Os -s -Wall -Werror -o "$PB/launcher" "$ROOT/scripts/launcher.c"
+  # One launcher, hard-linked under every program name (it finds its own name
+  # via /proc/self/exe), so the tarball stores it once; and a symlink to the
+  # loader per program, which sets the process name (see launcher.c).
+  local f n first=""
+  mkdir -p "$PKG/libexec/ld"
+  for f in "$PKG/libexec/"*; do
+    [ -f "$f" ] || continue
+    n="$(basename "$f")"
+    if [ -z "$first" ]; then
+      first="$PKG/bin/$n"; cp "$PB/launcher" "$first"
+    else
+      ln "$first" "$PKG/bin/$n"
+    fi
+    ln -s "../../lib/$LDSO" "$PKG/libexec/ld/$n"
+  done
+}
+
 json_list() { local first=1 x; printf '['; for x in "$@"; do [ $first = 1 ] || printf ', '; first=0; printf '"%s"' "$x"; done; printf ']'; }
 
 package() {
@@ -376,8 +450,8 @@ package() {
 
   # Licences of everything statically linked into the bundle.
   local lic="$PKG/share/licenses"; mkdir -p "$lic"
-  cp "$B/src/postgresql-$PG_VERSION"/*/COPYRIGHT "$lic/postgresql.txt"
-  cp "$B/src/pg_clickhouse-$PGCH_VERSION"/*/LICENSE.md "$lic/pg_clickhouse.md"
+  cp "$PB/src/postgresql-$PG_VERSION"/*/COPYRIGHT "$lic/postgresql.txt"
+  cp "$PB/src/pg_clickhouse-$PGCH_VERSION"/*/LICENSE.md "$lic/pg_clickhouse.md"
   cp "$B/src/openssl-$OPENSSL_VERSION"/*/LICENSE.txt "$lic/openssl.txt"
   cp "$B/src/curl-$CURL_VERSION"/*/COPYING "$lic/curl.txt"
   cp "$B/src/lz4-$LZ4_VERSION"/*/lib/LICENSE "$lic/lz4.txt"
@@ -389,13 +463,19 @@ package() {
     cp "$B/src/util-linux-$UTIL_LINUX_VERSION"/*/libuuid/COPYING "$lic/libuuid.txt"
   fi
 
-  local f
+  # musl: the real executables move to libexec/; bin/ gets launchers that run
+  # them through the bundled loader (see scripts/launcher.c).
+  [ "$LIBC" = musl ] && { mkdir -p "$PKG/libexec"; mv "$PKG/bin/"* "$PKG/libexec/"; }
+
+  local f bindirs=("$PKG/bin" "$PKG/lib")
+  [ "$LIBC" = musl ] && bindirs=("$PKG/libexec" "$PKG/lib")
   while IFS= read -r -d '' f; do
     [ -L "$f" ] && continue
     if [ "$OS" = Darwin ]; then is_macho "$f" && fix_macho "$f"
     else is_elf "$f" && fix_elf "$f"; fi
-  done < <(find "$PKG/bin" "$PKG/lib" -maxdepth 2 -type f -print0)
+  done < <(find "${bindirs[@]}" -maxdepth 2 -type f -print0)
   [ "$OS" = Linux ] && check_elf_undefined
+  [ "$LIBC" = musl ] && package_musl_runtime
 
   local commit repo dirty="" deps_json
   commit="${PGB_COMMIT:-$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || echo unknown)}"
@@ -407,9 +487,12 @@ package() {
   repo="${PGB_REPO:-${GITHUB_REPOSITORY:-sdairs/pg-bundles}}"
   deps_json="\"openssl\": \"$OPENSSL_VERSION\", \"curl\": \"$CURL_VERSION\", \"lz4\": \"$LZ4_VERSION\", \"zstd\": \"$ZSTD_VERSION\""
   local platform_json
-  if [ "$OS" = Linux ]; then
+  if [ "$LIBC" = gnu ]; then
     deps_json="$deps_json, \"zlib\": \"$ZLIB_VERSION\", \"libedit\": \"$LIBEDIT_VERSION\", \"ncurses\": \"$NCURSES_VERSION\", \"libuuid\": \"util-linux $UTIL_LINUX_VERSION\""
-    platform_json="\"min_glibc\": \"$(ldd --version | sed -n 1p | awk '{print $NF}')\""
+    platform_json="\"libc\": \"glibc\", \"min_glibc\": \"$(max_glibc_symbol)\""
+  elif [ "$LIBC" = musl ]; then
+    deps_json="$deps_json, \"zlib\": \"$ZLIB_VERSION\", \"libedit\": \"$LIBEDIT_VERSION\", \"ncurses\": \"$NCURSES_VERSION\", \"libuuid\": \"util-linux $UTIL_LINUX_VERSION\", \"musl\": \"$MUSL_VERSION\""
+    platform_json="\"libc\": \"musl\", \"bundled_loader\": \"lib/$LDSO\", \"host_libc\": [\"glibc\", \"musl\"]"
   else
     platform_json="\"min_macos\": \"$MACOSX_DEPLOYMENT_TARGET\""
   fi
@@ -429,7 +512,9 @@ EOF
   local tgz="$DIST/$NAME.tar.gz"
   rm -f "$tgz" "$tgz.sha256"
   if tar --version 2>/dev/null | grep 'GNU tar' >/dev/null; then
-    tar -C "$PKG_ROOT" --owner=0 --group=0 --numeric-owner --sort=name -cf - "$NAME" | gzip -9n >"$tgz"
+    # Sorted member list (GNU tar 1.26 in CentOS 7 has no --sort=name).
+    (cd "$PKG_ROOT" && find "$NAME" -print0 | LC_ALL=C sort -z \
+      | tar --owner=0 --group=0 --numeric-owner --no-recursion --null -T - -cf -) | gzip -9n >"$tgz"
   else
     COPYFILE_DISABLE=1 tar -C "$PKG_ROOT" --uid 0 --gid 0 --no-xattrs --no-mac-metadata -cf - "$NAME" | gzip -9n >"$tgz"
   fi

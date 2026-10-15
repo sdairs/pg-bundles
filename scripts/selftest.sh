@@ -11,8 +11,13 @@
 #   4. if ClickHouse is reachable: foreign servers for both pg_clickhouse drivers
 #      (http and binary), a real table in ClickHouse, queries through foreign
 #      tables and clickhouse_query()
-#   5. pg_ctl stop -m fast
-#   6. dependency closure contains only allowed system libraries
+#   5. runtime libraries: every shared object mapped into a backend that has
+#      loaded pg_clickhouse (and queried ClickHouse) comes from the bundle or
+#      the OS (Linux: the backend's /proc/self/maps; macOS: DYLD_PRINT_LIBRARIES)
+#   6. pg_ctl stop -m fast
+#   7. dependency closure contains only allowed system libraries, minimum OS
+#      versions (GLIBC_ symbol versions / LC_BUILD_VERSION minos) within the
+#      bundle's baseline
 #
 # Environment:
 #   CLICKHOUSE_HOST         default 127.0.0.1
@@ -23,6 +28,10 @@
 #   PGB_SELFTEST_CLICKHOUSE auto (default: run step 4 if reachable) | require | skip
 #   PGB_SELFTEST_REPORT     optional path; a JSON summary is written there
 #   PGB_SELFTEST_KEEP=1     keep the temp dir for debugging
+#   PGB_SELFTEST_MAX_GLIBC  highest GLIBC_ symbol version allowed (default 2.17)
+#
+# The static ELF checks need readelf or objdump (binutils); without them they
+# are skipped with a log line, and the runtime library check (step 5) still runs.
 set -euo pipefail
 
 TARBALL="${1:?usage: selftest.sh <bundle.tar.gz>}"
@@ -47,6 +56,8 @@ if [ "$(id -u)" = 0 ]; then
 fi
 
 now_ms() {
+  # bash 5: EPOCHREALTIME; else GNU date %N (busybox date ignores %N); else perl.
+  if [ -n "${EPOCHREALTIME:-}" ]; then local t="${EPOCHREALTIME/[.,]/}"; echo $((10#$t / 1000)); return; fi
   local t; t="$(date +%s%N 2>/dev/null || true)"
   case "$t" in *N|"") perl -MTime::HiRes=time -e 'printf "%d\n", time()*1000' ;; *) echo $((t / 1000000)) ;; esac
 }
@@ -100,6 +111,18 @@ P="$TMP/$NAME"
 [ -d "$P/bin" ] && [ -f "$P/BUNDLE.json" ] || fail "unexpected layout (no $NAME/bin or BUNDLE.json)"
 ok "extracted in $((T_EXTRACT - T0)) ms"
 cat "$P/BUNDLE.json"
+LIBC=""
+HOST_DESC="$(uname -sm)"
+[ "$OS" = Darwin ] && HOST_DESC="macOS $(sw_vers -productVersion) $(uname -m)"
+[ -r /etc/os-release ] && HOST_DESC="$(. /etc/os-release; echo "${PRETTY_NAME:-$ID}") $(uname -m)"
+if [ "$OS" = Linux ]; then
+  LIBC=gnu
+  LDSO="$(cd "$P/lib" && ls ld-musl-*.so.1 2>/dev/null | head -1 || true)"
+  [ -n "$LDSO" ] && LIBC=musl
+  echo "host: $(uname -srm), $( (ldd --version 2>&1 || true) | sed -n '1p;2p' | tr '\n' ' ')"
+  echo "host os: $HOST_DESC"
+  echo "bundle libc: $LIBC${LDSO:+ (bundled loader lib/$LDSO)}"
+fi
 
 # --------------------------------------------------------------- 1 initdb ----
 step "1. initdb"
@@ -190,7 +213,6 @@ SQL
   echo "binary driver: $BIN_OUT"
   echo "join:          $JOIN_OUT"
   echo "ClickHouse:    $VER_OUT"
-  run "${PSQL[@]}" -qc "CALL clickhouse_perform('ch_http', 'DROP TABLE IF EXISTS $TBL');"
   [ "$HTTP_OUT" = "1000|499500|row-999" ] || fail "http driver query returned '$HTTP_OUT'"
   [ "$BIN_OUT" = "1000|499500|row-999" ] || fail "binary driver query returned '$BIN_OUT'"
   [ "$JOIN_OUT" = "111" ] || fail "join query returned '$JOIN_OUT'"
@@ -198,20 +220,63 @@ SQL
   CH_RESULT="passed (ClickHouse $VER_OUT)"
 fi
 
-# ----------------------------------------------------------------- 5 stop ----
-step "5. pg_ctl stop -m fast"
+# ------------------------------------------------------ 5 runtime libs ----
+RUNTIME_BAD=0
+if [ "$OS" = Linux ]; then
+  step "5. runtime libraries mapped into a backend (/proc/self/maps)"
+  MAPS_SQL=(-c "LOAD 'pg_clickhouse';")
+  if [ -n "${TBL:-}" ]; then
+    MAPS_SQL+=(-c "SELECT count(*) FROM ft_http;" -c "SELECT count(*) FROM ft_bin;")
+  fi
+  MAPS_SQL+=(-c "SELECT pg_read_file('/proc/self/maps');")
+  MAPS="$(run "${PSQL[@]}" -At "${MAPS_SQL[@]}" | awk '$1 ~ /^[0-9a-f]+-[0-9a-f]+$/ && NF >= 6 { $1=$2=$3=$4=$5=""; sub(/^ +/, ""); print }' | sort -u)"
+  [ -n "$MAPS" ] || { echo "no /proc/self/maps output" >&2; RUNTIME_BAD=1; }
+  RP="$(cd "$P" && pwd -P)"
+  # Shared objects glibc itself may map from the host (libc, its loader, the
+  # libraries split out of libc before 2.34, NSS modules and libresolv).
+  GLIBC_RT_RE='^(libc|libm|libpthread|libdl|librt|libutil|libresolv|libnss_[a-z0-9]+)(\.so\.[0-9]+|-[0-9.]+\.so)$|^ld-linux[-a-z0-9_.]*\.so\.[0-9]+$|^ld-[0-9.]+\.so$'
+  NSO=0
+  while IFS= read -r m; do
+    m="${m% (deleted)}"
+    case "$m" in /*) ;; *) continue ;; esac      # [heap], [stack], [vdso], ...
+    case "$m" in "$RP"/*|"$P"/*) NSO=$((NSO + 1)); continue ;; esac
+    base="${m##*/}"
+    case "$base" in *.so|*.so.*) ;; *) continue ;; esac   # /dev/zero, shared memory, ...
+    NSO=$((NSO + 1))
+    if [ "$LIBC" = gnu ] && [[ "$base" =~ $GLIBC_RT_RE ]]; then continue; fi
+    printf 'disallowed runtime mapping: %s\n' "$m" >&2; RUNTIME_BAD=1
+  done <<<"$MAPS"
+  printf '%s\n' "$MAPS" | grep '/pg_clickhouse\.so$' >/dev/null || { echo "pg_clickhouse.so is not mapped" >&2; RUNTIME_BAD=1; }
+  echo "shared objects mapped into the backend:"
+  printf '%s\n' "$MAPS" | grep -E '\.so(\.[0-9.]+)?$' | sed "s|^$RP/|<bundle>/|; s|^$P/|<bundle>/|" | sed 's/^/  /'
+  [ "$RUNTIME_BAD" = 0 ] || fail "a backend mapped shared objects from outside the bundle"
+  if [ "$LIBC" = musl ]; then ok "$NSO shared objects mapped, all from the bundle (no host libraries)"
+  else ok "$NSO shared objects mapped, all from the bundle or host glibc"; fi
+else
+  step "5. runtime libraries (checked from DYLD_PRINT_LIBRARIES output in step 7)"
+fi
+if [ -n "${TBL:-}" ]; then
+  run "${PSQL[@]}" -qc "CALL clickhouse_perform('ch_http', 'DROP TABLE IF EXISTS $TBL');"
+fi
+
+# ----------------------------------------------------------------- 6 stop ----
+step "6. pg_ctl stop -m fast"
 run "$P/bin/pg_ctl" -D "$TMP/data" stop -m fast -w >/dev/null
 for _ in $(seq 1 50); do kill -0 "$PG_PID" 2>/dev/null || break; sleep 0.1; done
 kill -0 "$PG_PID" 2>/dev/null && fail "postgres still running after pg_ctl stop"
 PG_PID=""
 ok "stopped"
 
-# ------------------------------------------------------ 6 dep closure ----
-step "6. dependency closure"
+# ------------------------------------------------------ 7 dep closure ----
+step "7. dependency closure"
 BAD=0
 bad() { printf 'disallowed: %s\n' "$*" >&2; BAD=1; }
 NBIN=0
+ver_le() { [ "$(printf '%s\n%s\n' "$1" "$2" | sort -t. -k1,1n -k2,2n -k3,3n | tail -1)" = "$2" ]; }
 if [ "$OS" = Darwin ]; then
+  MIN_MACOS="$(sed -n 's/.*"min_macos": *"\([0-9.]*\)".*/\1/p' "$P/BUNDLE.json")"
+  [ -n "$MIN_MACOS" ] || bad "BUNDLE.json has no platform.min_macos"
+  MAXMINOS=0.0
   while IFS= read -r -d '' f; do
     file -b "$f" | grep '^Mach-O' >/dev/null || continue
     NBIN=$((NBIN + 1))
@@ -235,7 +300,15 @@ if [ "$OS" = Darwin ]; then
       esac
     done < <(otool -l "$f" | awk '/cmd LC_RPATH/{getline; getline; print $2}')
     codesign -v "$f" 2>/dev/null || bad "$rel has an invalid code signature"
+    # Minimum OS: LC_BUILD_VERSION minos (or LC_VERSION_MIN_MACOSX for < 10.14).
+    minos="$(otool -l "$f" | awk '/cmd LC_BUILD_VERSION/{b=1} b && $1=="minos"{print $2; exit} /cmd LC_VERSION_MIN_MACOSX/{getline; getline; print $2; exit}')"
+    if [ -z "$minos" ]; then bad "$rel has no LC_BUILD_VERSION / LC_VERSION_MIN_MACOSX"
+    else
+      [ -n "$MIN_MACOS" ] && ! ver_le "$minos" "$MIN_MACOS" && bad "$rel minos $minos > bundle min_macos $MIN_MACOS"
+      ver_le "$minos" "$MAXMINOS" || MAXMINOS="$minos"
+    fi
   done < <(find "$P/bin" "$P/lib" -type f -print0)
+  echo "highest Mach-O minos: $MAXMINOS (bundle min_macos $MIN_MACOS)"
   # Runtime: every image dyld loaded into postgres / its backends (including
   # pg_clickhouse.dylib after CREATE EXTENSION) must be in the bundle or the OS.
   LOADED="$(grep -E '^dyld\[[0-9]+\]: <' "$TMP/postgres.log" | sed -E 's/^dyld\[[0-9]+\]: <[^>]*> //' | sort -u || true)"
@@ -254,28 +327,65 @@ if [ "$OS" = Darwin ]; then
   find "$P/bin" "$P/lib" -type f -exec otool -L {} + 2>/dev/null | awk '/^\t/{print $1}' \
     | grep -v '^@rpath/' | sort | uniq -c | sort -rn
 else
-  ALLOWED_RE='^(libc\.so\.6|libm\.so\.6|libpthread\.so\.0|libdl\.so\.2|librt\.so\.1|libutil\.so\.1|ld-linux-x86-64\.so\.2|ld-linux-aarch64\.so\.1)$'
+  MAX_GLIBC="${PGB_SELFTEST_MAX_GLIBC:-2.17}"
+  if [ "$LIBC" = musl ]; then
+    # Only the bundled musl (whose loader is also its libc) may be needed.
+    ALLOWED_RE='^libc\.musl-(x86_64|aarch64)\.so\.1$'
+  else
+    ALLOWED_RE='^(libc\.so\.6|libm\.so\.6|libpthread\.so\.0|libdl\.so\.2|librt\.so\.1|libutil\.so\.1|ld-linux-x86-64\.so\.2|ld-linux-aarch64\.so\.1)$'
+  fi
+  HAVE_ELF_TOOLS=1
   if command -v readelf >/dev/null; then
     elf_needed() { readelf -d "$1" | sed -n 's/.*(NEEDED).*\[\(.*\)\]/\1/p'; }
     elf_rpath()  { readelf -d "$1" | sed -n 's/.*(R\(UN\)\{0,1\}PATH).*\[\(.*\)\]/\2/p'; }
+    elf_interp() { readelf -l "$1" | sed -n 's/.*Requesting program interpreter: \(.*\)\]/\1/p'; }
   elif command -v objdump >/dev/null; then
     elf_needed() { objdump -p "$1" | awk '$1=="NEEDED"{print $2}'; }
     elf_rpath()  { objdump -p "$1" | awk '$1=="RUNPATH"||$1=="RPATH"{print $2}'; }
+    elf_interp() { objdump -s -j .interp "$1" 2>/dev/null | grep -q 'Contents' && echo present || true; }
   else
-    fail "need readelf or objdump (binutils) for the dependency check"
+    HAVE_ELF_TOOLS=0
   fi
+  is_elf() { [ "$(head -c 4 "$1" | tr -d '\177')" = ELF ]; }
+  ELF_DIRS=("$P/bin" "$P/lib"); [ -d "$P/libexec" ] && ELF_DIRS+=("$P/libexec")
   MAXGLIBC=0.0
   while IFS= read -r -d '' f; do
-    head -c 4 "$f" | grep 'ELF' >/dev/null || continue
+    is_elf "$f" || continue
     NBIN=$((NBIN + 1))
     rel="${f#"$P"/}"
+    if [ "$LIBC" = musl ]; then
+      case "$rel" in
+        lib/"$LDSO") continue ;;
+        bin/*)
+          # Launchers: static executables, no loader, no libraries.
+          if [ "$HAVE_ELF_TOOLS" = 1 ]; then
+            [ -z "$(elf_interp "$f")" ] || bad "$rel has a program interpreter (launchers must be static)"
+            [ -z "$(elf_needed "$f")" ] || bad "$rel needs shared libraries (launchers must be static)"
+          fi
+          [ -f "$P/libexec/${rel#bin/}" ] || bad "$rel has no libexec/${rel#bin/}"
+          continue ;;
+      esac
+      # Resolve with the bundled loader (works on any host libc). Server
+      # modules reference postgres symbols, which only resolve when loaded
+      # into postgres, so their "Error relocating" lines are expected.
+      while read -r line; do
+        case "$rel/$line" in lib/postgresql/*"/Error relocating "*) continue ;; esac
+        case "$line" in
+          # libc is the loader itself; ldd mode prints it under the program's PT_INTERP name.
+          libc.musl-*" => "*) ;;
+          *"=> $P/"*|"$P/"*|"") ;;
+          *"=>"*|*"not found"*|*"rror"*) bad "$rel: $line" ;;
+        esac
+      done < <(run "$P/lib/$LDSO" --library-path="$P/lib" --list "$f" 2>&1 | sed 's/^[[:space:]]*//' || true)
+    fi
+    [ "$HAVE_ELF_TOOLS" = 1 ] || continue
     for n in $(elf_needed "$f" || true); do
       if [[ "$n" =~ $ALLOWED_RE ]]; then :; elif [ -e "$P/lib/$n" ]; then :; else bad "$rel NEEDED $n"; fi
     done
     for rp in $(elf_rpath "$f" | tr ':' ' ' || true); do
       case "$rp" in '$ORIGIN'|'$ORIGIN/'*) ;; *) bad "$rel RPATH/RUNPATH $rp" ;; esac
     done
-    if command -v ldd >/dev/null; then
+    if [ "$LIBC" = gnu ] && command -v ldd >/dev/null; then
       while read -r line; do
         case "$line" in
           *"not found"*) bad "$rel: $line" ;;
@@ -285,18 +395,25 @@ else
       done < <(ldd "$f" 2>/dev/null | sed 's/^[[:space:]]*//' | grep -v 'statically linked' || true)
     fi
     if command -v objdump >/dev/null; then
-      v="$(objdump -T "$f" 2>/dev/null | grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' | sort -t. -k1,1n -k2,2n | tail -1 || true)"
+      v="$(objdump -T "$f" 2>/dev/null | grep -o 'GLIBC_[0-9][0-9.]*' | sed 's/GLIBC_//' | sort -t. -k1,1n -k2,2n | tail -1 || true)"
       if [ -n "$v" ] && [ "$(printf '%s\n%s\n' "$v" "$MAXGLIBC" | sort -t. -k1,1n -k2,2n | tail -1)" = "$v" ]; then MAXGLIBC="$v"; fi
     fi
-  done < <(find "$P/bin" "$P/lib" -type f -print0)
-  if [ "$MAXGLIBC" != 0.0 ]; then
-    echo "highest GLIBC symbol version required: $MAXGLIBC"
-    [ "$(printf '%s\n2.28\n' "$MAXGLIBC" | sort -t. -k1,1n -k2,2n | tail -1)" = 2.28 ] \
-      || bad "requires GLIBC_$MAXGLIBC (> 2.28 baseline)"
+  done < <(find "${ELF_DIRS[@]}" -type f -print0)
+  if [ "$HAVE_ELF_TOOLS" = 0 ]; then
+    echo "SKIP: static ELF checks (NEEDED, RUNPATH, GLIBC_ versions) need readelf or objdump (binutils); runtime check in step 5 passed"
+  elif [ "$LIBC" = musl ]; then
+    [ "$MAXGLIBC" = 0.0 ] || bad "musl bundle references GLIBC_$MAXGLIBC symbols"
+    echo "no GLIBC_ symbol versions referenced (musl bundle)"
+  elif [ "$MAXGLIBC" != 0.0 ]; then
+    echo "highest GLIBC symbol version required: $MAXGLIBC (ceiling $MAX_GLIBC)"
+    [ "$(printf '%s\n%s\n' "$MAXGLIBC" "$MAX_GLIBC" | sort -t. -k1,1n -k2,2n | tail -1)" = "$MAX_GLIBC" ] \
+      || bad "requires GLIBC_$MAXGLIBC (> $MAX_GLIBC baseline)"
   fi
-  echo "NEEDED closure of all bundle ELF files:"
-  find "$P/bin" "$P/lib" -type f -print0 | while IFS= read -r -d '' f; do
-    if head -c 4 "$f" | grep ELF >/dev/null; then elf_needed "$f"; fi; done | sort | uniq -c | sort -rn
+  if [ "$HAVE_ELF_TOOLS" = 1 ]; then
+    echo "NEEDED closure of all bundle ELF files:"
+    find "${ELF_DIRS[@]}" -type f -print0 | while IFS= read -r -d '' f; do
+      if is_elf "$f"; then elf_needed "$f"; fi; done | sort | uniq -c | sort -rn
+  fi
 fi
 [ "$BAD" = 0 ] || fail "dependency closure contains disallowed libraries"
 ok "$NBIN binaries checked, only system libraries and bundled libs"
@@ -306,8 +423,9 @@ CSIZE="$(wc -c <"$TARBALL" | tr -d ' ')"
 ESIZE="$(du -sk "$P" | awk '{print $1*1024}')"
 step "summary"
 awk -v n="$NAME" -v c="$CSIZE" -v e="$ESIZE" -v x="$((T_EXTRACT - T0))" -v i="$((T_INITDB - T_EXTRACT))" \
-    -v s="$((T_READY - T_INITDB))" -v t="$((T_READY - T0))" -v ch="$CH_RESULT" 'BEGIN {
+    -v s="$((T_READY - T_INITDB))" -v t="$((T_READY - T0))" -v ch="$CH_RESULT" -v h="$HOST_DESC" 'BEGIN {
   printf "bundle:              %s\n", n
+  printf "host:                %s\n", h
   printf "compressed size:     %d bytes (%.1f MiB)\n", c, c/1048576
   printf "extracted size:      %d bytes (%.1f MiB)\n", e, e/1048576
   printf "extract:             %d ms\n", x
@@ -321,7 +439,7 @@ if [ -n "${PGB_SELFTEST_REPORT:-}" ]; then
 {"bundle": "$NAME", "compressed_bytes": $CSIZE, "extracted_bytes": $ESIZE,
  "extract_ms": $((T_EXTRACT - T0)), "initdb_ms": $((T_INITDB - T_EXTRACT)),
  "start_ms": $((T_READY - T_INITDB)), "extract_to_ready_ms": $((T_READY - T0)),
- "pg_clickhouse": "$EXT_VER", "clickhouse": "$CH_RESULT"}
+ "pg_clickhouse": "$EXT_VER", "clickhouse": "$CH_RESULT", "host": "$HOST_DESC"}
 EOF
 fi
 echo "SELFTEST PASSED: $NAME"

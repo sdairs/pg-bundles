@@ -16,19 +16,34 @@ concurrency:
 
 jobs:
   linux:
-    name: ${{ matrix.target }}
+    name: pg${{ matrix.pg }} ${{ matrix.arch }}-unknown-linux-${{ matrix.libc }}
     strategy:
       fail-fast: false
       matrix:
+        pg: ["17", "18"]
+        arch: [x86_64, aarch64]
+        libc: [gnu, musl]
         include:
-          - target: x86_64-unknown-linux-gnu
-            arch: x86_64
+          - arch: x86_64
             runner: ubuntu-24.04
-          - target: aarch64-unknown-linux-gnu
-            arch: aarch64
+          - arch: aarch64
             runner: ubuntu-24.04-arm
+          # Extra distros the bundle is self-tested in (besides the Ubuntu 24.04
+          # runner): the oldest glibc we support, and for musl bundles Alpine.
+          - libc: gnu
+            distros: >-
+              centos:7@sha256:be65f488b7764ad3638f236b7b515b3678369a5124c47b8d32916d6487418ea4
+              debian:10@sha256:58ce6f1271ae1c8a2006ff7d3e54e9874d839f573d8009c20154ad0f2fb0a225
+          - libc: musl
+            distros: >-
+              alpine:3.24.2@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6
+              centos:7@sha256:be65f488b7764ad3638f236b7b515b3678369a5124c47b8d32916d6487418ea4
+              debian:10@sha256:58ce6f1271ae1c8a2006ff7d3e54e9874d839f573d8009c20154ad0f2fb0a225
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
+    env:
+      TARGET: ${{ matrix.arch }}-unknown-linux-${{ matrix.libc }}
+      PG_MAJOR: ${{ matrix.pg }}
     services:
       clickhouse:
         image: clickhouse/clickhouse-server:26.8@sha256:bc1a1d93355508c1414bb692e6e56972b492dad55a7891cb63c6e6f1b9697236
@@ -50,25 +65,39 @@ jobs:
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: .build/sources
-          key: sources-${{ hashFiles('scripts/versions.env') }}
+          key: sources-pg${{ matrix.pg }}-${{ matrix.libc }}-${{ hashFiles('scripts/versions.env') }}
 
-      - name: Build in manylinux_2_28 (glibc 2.28) container
-        run: scripts/build-linux.sh "${{ matrix.arch }}"
+      - name: Build (manylinux2014 for gnu, Alpine for musl)
+        run: scripts/build-linux.sh "${{ matrix.arch }}" "${{ matrix.libc }}"
 
-      - name: Self-test (host glibc, ClickHouse service container)
+      - name: Self-test (runner, Ubuntu 24.04, ClickHouse service container)
         env:
           CLICKHOUSE_HOST: 127.0.0.1
           CLICKHOUSE_HTTP_PORT: "8123"
           CLICKHOUSE_NATIVE_PORT: "9000"
           PGB_SELFTEST_CLICKHOUSE: require
         run: |
-          tgz=$(ls dist/*-${{ matrix.target }}.tar.gz)
+          tgz=$(ls dist/*-"$TARGET".tar.gz)
           PGB_SELFTEST_REPORT="${tgz%.tar.gz}.selftest.json" scripts/selftest.sh "$tgz" | tee selftest.log
-          { echo '### ${{ matrix.target }}'; echo '```'; sed -n '/^--- summary/,$p' selftest.log; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          { echo "### pg${PG_MAJOR} ${TARGET} on the runner"; echo '```'; sed -n '/^--- summary/,$p' selftest.log; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Self-test in other distros
+        env:
+          CLICKHOUSE_HOST: 127.0.0.1
+          CLICKHOUSE_HTTP_PORT: "8123"
+          CLICKHOUSE_NATIVE_PORT: "9000"
+          PGB_SELFTEST_CLICKHOUSE: require
+          DISTROS: ${{ matrix.distros }}
+        run: |
+          tgz=$(ls dist/*-"$TARGET".tar.gz)
+          for image in $DISTROS; do
+            scripts/selftest-container.sh "$image" "$tgz" | tee selftest-distro.log
+            { echo "### pg${PG_MAJOR} ${TARGET} in ${image%@*}"; echo '```'; sed -n '/^--- summary/,$p' selftest-distro.log; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          done
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: bundle-${{ matrix.target }}
+          name: bundle-pg${{ matrix.pg }}-${{ env.TARGET }}
           path: |
             dist/*.tar.gz
             dist/*.tar.gz.sha256
@@ -76,10 +105,12 @@ jobs:
           if-no-files-found: error
 
   macos:
-    name: ${{ matrix.target }}
+    name: pg${{ matrix.pg }} ${{ matrix.target }}
     strategy:
       fail-fast: false
       matrix:
+        pg: ["17", "18"]
+        target: [aarch64-apple-darwin, x86_64-apple-darwin]
         include:
           - target: aarch64-apple-darwin
             runner: macos-15
@@ -87,6 +118,9 @@ jobs:
             runner: macos-15-intel
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
+    env:
+      TARGET: ${{ matrix.target }}
+      PG_MAJOR: ${{ matrix.pg }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -96,7 +130,7 @@ jobs:
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: .build/sources
-          key: sources-${{ hashFiles('scripts/versions.env') }}
+          key: sources-pg${{ matrix.pg }}-macos-${{ hashFiles('scripts/versions.env') }}
 
       - name: Build
         run: scripts/build.sh
@@ -114,17 +148,19 @@ jobs:
           CLICKHOUSE_NATIVE_PORT: "9000"
           PGB_SELFTEST_CLICKHOUSE: require
         run: |
-          tgz=$(ls dist/*-${{ matrix.target }}.tar.gz)
+          tgz=$(ls dist/*-"$TARGET".tar.gz)
           PGB_SELFTEST_REPORT="${tgz%.tar.gz}.selftest.json" scripts/selftest.sh "$tgz" | tee selftest.log
-          { echo '### ${{ matrix.target }}'; echo '```'; sed -n '/^--- summary/,$p' selftest.log; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          { echo "### pg${PG_MAJOR} ${TARGET}"; echo '```'; sed -n '/^--- summary/,$p' selftest.log; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Stop ClickHouse
         if: always() && steps.clickhouse.outputs.pid != ''
-        run: kill "${{ steps.clickhouse.outputs.pid }}" || true
+        env:
+          CH_PID: ${{ steps.clickhouse.outputs.pid }}
+        run: kill "$CH_PID" || true
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: bundle-${{ matrix.target }}
+          name: bundle-pg${{ matrix.pg }}-${{ matrix.target }}
           path: |
             dist/*.tar.gz
             dist/*.tar.gz.sha256
@@ -148,13 +184,31 @@ jobs:
           path: dist
           merge-multiple: true
 
+      - name: Check every bundle is present
+        run: |
+          . scripts/versions.env
+          missing=0
+          for major in $PG_MAJORS; do
+            v="PG${major}_VERSION"
+            for t in aarch64-apple-darwin x86_64-apple-darwin \
+                     x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu \
+                     x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
+              f="dist/pg-${!v}-pgch-${PGCH_VERSION}-$t.tar.gz"
+              for g in "$f" "$f.sha256"; do [ -f "$g" ] || { echo "missing $g"; missing=1; }; done
+            done
+          done
+          ls -l dist
+          exit "$missing"
+
       - name: Release notes
         run: |
           . scripts/versions.env
           {
-            echo "PostgreSQL ${PG_VERSION} with pg_clickhouse ${PGCH_VERSION}, built from ${GITHUB_SHA}."
+            echo "PostgreSQL ${PG17_VERSION} and ${PG18_VERSION} with pg_clickhouse ${PGCH_VERSION}, built from ${GITHUB_SHA}."
             echo
-            echo "OpenSSL ${OPENSSL_VERSION}, curl ${CURL_VERSION}, lz4 ${LZ4_VERSION}, zstd ${ZSTD_VERSION}; Linux builds target glibc 2.28."
+            echo "OpenSSL ${OPENSSL_VERSION}, curl ${CURL_VERSION}, lz4 ${LZ4_VERSION}, zstd ${ZSTD_VERSION}."
+            echo "\`*-unknown-linux-gnu\` bundles need glibc 2.17+. \`*-unknown-linux-musl\` bundles carry their own musl ${MUSL_VERSION} loader and run on any Linux, glibc or musl (Alpine)."
+            echo "macOS bundles need macOS 11.0+ (Apple silicon) or 10.13+ (Intel)."
             echo "Self-test timings were measured on GitHub-hosted runners (extract, initdb, start, wait for pg_isready)."
             echo
             echo "| Bundle | Compressed | Extracted | Extract to pg_isready | Start to pg_isready | ClickHouse query |"
