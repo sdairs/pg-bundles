@@ -161,12 +161,16 @@ jobs:
             dist/*.selftest.json
           if-no-files-found: error
 
-  release:
-    if: startsWith(github.ref, 'refs/tags/v')
+  # Runs on every build, so the manifest a release would publish is generated
+  # and validated for pull requests too. Needs every bundle job to have passed
+  # its self-tests.
+  manifest:
+    name: manifest.json
     needs: [linux, macos]
     runs-on: ubuntu-24.04
-    permissions:
-      contents: write
+    env:
+      # A real tag for a release; a placeholder otherwise.
+      RELEASE: ${{ (github.ref_type == 'tag' && github.ref_name) || 'v0.0.0-dev' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -178,30 +182,27 @@ jobs:
           path: dist
           merge-multiple: true
 
-      - name: Check every bundle is present
+      # Fails unless every PostgreSQL major x target bundle is present with
+      # the versions pinned in versions.env, was built from this commit, and
+      # its sha256 and size match the manifest and its .sha256 file.
+      - name: Generate and validate manifest.json
         run: |
-          . scripts/versions.env
-          missing=0
-          for major in $PG_MAJORS; do
-            v="PG${major}_VERSION"
-            for t in aarch64-apple-darwin x86_64-apple-darwin \
-                     x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
-              f="dist/pg-${!v}-pgch-${PGCH_VERSION}-$t.tar.gz"
-              for g in "$f" "$f.sha256"; do [ -f "$g" ] || { echo "missing $g"; missing=1; }; done
-            done
-          done
           ls -l dist
-          exit "$missing"
+          scripts/manifest.py generate --release "$RELEASE" --dist dist --commit "$(git rev-parse HEAD)"
+          scripts/manifest.py validate --dist dist --release "$RELEASE" --check-source
+          cat dist/manifest.json
+          { echo "### manifest.json"; echo '```json'; cat dist/manifest.json; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Release notes
         run: |
           . scripts/versions.env
           {
-            echo "PostgreSQL ${PG17_VERSION} and ${PG18_VERSION} with pg_clickhouse ${PGCH_VERSION}, built from ${GITHUB_SHA}."
+            echo "PostgreSQL $(jq -r '[.bundles[].postgres_version] | unique | join(" and ")' dist/manifest.json) with pg_clickhouse ${PGCH_VERSION}, built from $(jq -r .source.commit dist/manifest.json)."
             echo
             echo "OpenSSL ${OPENSSL_VERSION}, curl ${CURL_VERSION}, lz4 ${LZ4_VERSION}, zstd ${ZSTD_VERSION}."
             echo "\`*-unknown-linux-musl\` bundles carry their own musl ${MUSL_VERSION} loader and run on any Linux, glibc or musl (Alpine)."
             echo "macOS bundles need macOS 11.0+ (Apple silicon) or 10.13+ (Intel)."
+            echo "\`manifest.json\` lists every bundle with its sha256 and size."
             echo "Self-test timings were measured on GitHub-hosted runners (extract, initdb, start, wait for pg_isready)."
             echo
             echo "| Bundle | Compressed | Extracted | Extract to pg_isready | Start to pg_isready | ClickHouse query |"
@@ -211,13 +212,50 @@ jobs:
             done
             echo
             echo "Verify a download with \`shasum -a 256 -c <bundle>.tar.gz.sha256\`."
-          } > notes.md
-          cat notes.md
+          } > dist/notes.md
+          cat dist/notes.md
 
-      - name: Create release
-        env:
-          GH_TOKEN: ${{ github.token }}
-          TAG: ${{ github.ref_name }}
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-manifest
+          path: |
+            dist/manifest.json
+            dist/notes.md
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [manifest]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: bundle-*
+          path: dist
+          merge-multiple: true
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-manifest
+          path: dist
+
+      # The files about to be published are the ones the manifest job checked.
+      - name: Validate manifest.json again
         run: |
-          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --title "$TAG" --notes-file notes.md \
-            dist/*.tar.gz dist/*.tar.gz.sha256
+          scripts/manifest.py validate --dist dist --release "$TAG" --check-source
+
+      # gh uploads the assets to a draft and publishes it last, so
+      # releases/latest never points at a release without its manifest.
+      - name: Create release
+        run: |
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --title "$TAG" --notes-file dist/notes.md \
+            --verify-tag dist/*.tar.gz dist/*.tar.gz.sha256 dist/manifest.json
