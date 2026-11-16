@@ -90,6 +90,7 @@ jobs:
           path: .build/sources
           key: sources-pg${{ matrix.pg }}-musl-${{ hashFiles('scripts/versions.env') }}
           restore-keys: |
+            sources-pg${{ matrix.pg }}-musl-
             sources-
 
       - name: Build (Alpine container)
@@ -157,6 +158,7 @@ jobs:
           path: .build/sources
           key: sources-pg${{ matrix.pg }}-macos-${{ hashFiles('scripts/versions.env') }}
           restore-keys: |
+            sources-pg${{ matrix.pg }}-macos-
             sources-
 
       - name: Build

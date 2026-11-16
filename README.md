@@ -330,8 +330,8 @@ Which paths the server user must be able to reach:
   with modes 0755/0644, so root ownership is fine), and search (`x`) on every
   directory above it. `/root` is mode 0700 on Debian, Ubuntu and Alpine and
   0550 on CentOS, so a bundle under `/root/.clickhouse/postgres/` cannot be
-  executed by another user as extracted: the launcher fails with `Permission
-  denied`. Either `chmod o+x /root` (others can then pass through `/root` to
+  executed by another user as extracted: running `bin/postgres` fails with
+  `Permission denied`. Either `chmod o+x /root` (others can then pass through `/root` to
   paths they already know, but still cannot list it; the test runs this
   layout too), or install the bundle outside root's home (`/opt`, `/usr/local`,
   `/var/lib`).
