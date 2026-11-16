@@ -211,7 +211,7 @@ jobs:
               jq -r '"| `\(.bundle)` | \(.compressed_bytes/1048576*10|round/10) MiB | \(.extracted_bytes/1048576*10|round/10) MiB | \(.extract_to_ready_ms) ms | \(.start_ms) ms | \(.clickhouse) |"' "$f"
             done
             echo
-            echo "Verify a download with \`shasum -a 256 -c <bundle>.tar.gz.sha256\`."
+            echo "Verify a download with \`shasum -a 256 -c <bundle>.tar.gz.sha256\`, and its build provenance with \`gh attestation verify <bundle>.tar.gz -R ${GITHUB_REPOSITORY}\`."
           } > dist/notes.md
           cat dist/notes.md
 
@@ -227,8 +227,12 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v')
     needs: [manifest]
     runs-on: ubuntu-24.04
+    # contents: write creates the release. id-token and attestations sign the
+    # build provenance attestation.
     permissions:
       contents: write
+      id-token: write
+      attestations: write
     env:
       GH_TOKEN: ${{ github.token }}
       TAG: ${{ github.ref_name }}
@@ -252,6 +256,14 @@ jobs:
       - name: Validate manifest.json again
         run: |
           scripts/manifest.py validate --dist dist --release "$TAG" --check-source
+          cat dist/*.tar.gz.sha256 > SHA256SUMS
+          cat SHA256SUMS
+
+      # Verifiable with `gh attestation verify <bundle>.tar.gz -R <repo>`.
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-checksums: SHA256SUMS
 
       # gh uploads the assets to a draft and publishes it last, so
       # releases/latest never points at a release without its manifest.
