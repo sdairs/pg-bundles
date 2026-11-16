@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Self-test a pg-bundles tarball (see SPEC.md, "Self-test").
 #
-#   scripts/selftest.sh dist/pg-18.6-pgch-0.11.0-aarch64-apple-darwin.tar.gz
+#   scripts/selftest.sh dist/pg-18.7-pgch-0.11.1-aarch64-apple-darwin.tar.gz
 #
 # Runs from an extracted copy in a fresh random temp dir, as a non-root user,
 # with a scrubbed environment (no DYLD_* / LD_* / Homebrew paths):
@@ -15,9 +15,9 @@
 #      loaded pg_clickhouse (and queried ClickHouse) comes from the bundle or
 #      the OS (Linux: the backend's /proc/self/maps; macOS: DYLD_PRINT_LIBRARIES)
 #   6. pg_ctl stop -m fast
-#   7. dependency closure contains only allowed system libraries, minimum OS
-#      versions (GLIBC_ symbol versions / LC_BUILD_VERSION minos) within the
-#      bundle's baseline
+#   7. dependency closure: macOS bundles need only system libraries and their
+#      own lib/, with LC_BUILD_VERSION minos within the bundle's baseline;
+#      Linux (musl) bundles need nothing from the host at all
 #
 # Environment:
 #   CLICKHOUSE_HOST         default 127.0.0.1
@@ -28,7 +28,6 @@
 #   PGB_SELFTEST_CLICKHOUSE auto (default: run step 4 if reachable) | require | skip
 #   PGB_SELFTEST_REPORT     optional path; a JSON summary is written there
 #   PGB_SELFTEST_KEEP=1     keep the temp dir for debugging
-#   PGB_SELFTEST_MAX_GLIBC  highest GLIBC_ symbol version allowed (default 2.17)
 #
 # The static ELF checks need readelf or objdump (binutils); without them they
 # are skipped with a log line, and the runtime library check (step 5) still runs.
@@ -116,12 +115,13 @@ HOST_DESC="$(uname -sm)"
 [ "$OS" = Darwin ] && HOST_DESC="macOS $(sw_vers -productVersion) $(uname -m)"
 [ -r /etc/os-release ] && HOST_DESC="$(. /etc/os-release; echo "${PRETTY_NAME:-$ID}") $(uname -m)"
 if [ "$OS" = Linux ]; then
-  LIBC=gnu
+  # Linux bundles are musl bundles: they carry their own loader and libc.
   LDSO="$(cd "$P/lib" && ls ld-musl-*.so.1 2>/dev/null | head -1 || true)"
-  [ -n "$LDSO" ] && LIBC=musl
+  [ -n "$LDSO" ] || fail "no lib/ld-musl-<arch>.so.1 in the bundle (Linux bundles must be *-unknown-linux-musl)"
+  LIBC=musl
   echo "host: $(uname -srm), $( (ldd --version 2>&1 || true) | sed -n '1p;2p' | tr '\n' ' ')"
   echo "host os: $HOST_DESC"
-  echo "bundle libc: $LIBC${LDSO:+ (bundled loader lib/$LDSO)}"
+  echo "bundle libc: $LIBC (bundled loader lib/$LDSO)"
 fi
 
 # --------------------------------------------------------------- 1 initdb ----
@@ -232,9 +232,6 @@ if [ "$OS" = Linux ]; then
   MAPS="$(run "${PSQL[@]}" -At "${MAPS_SQL[@]}" | awk '$1 ~ /^[0-9a-f]+-[0-9a-f]+$/ && NF >= 6 { $1=$2=$3=$4=$5=""; sub(/^ +/, ""); print }' | sort -u)"
   [ -n "$MAPS" ] || { echo "no /proc/self/maps output" >&2; RUNTIME_BAD=1; }
   RP="$(cd "$P" && pwd -P)"
-  # Shared objects glibc itself may map from the host (libc, its loader, the
-  # libraries split out of libc before 2.34, NSS modules and libresolv).
-  GLIBC_RT_RE='^(libc|libm|libpthread|libdl|librt|libutil|libresolv|libnss_[a-z0-9]+)(\.so\.[0-9]+|-[0-9.]+\.so)$|^ld-linux[-a-z0-9_.]*\.so\.[0-9]+$|^ld-[0-9.]+\.so$'
   NSO=0
   while IFS= read -r m; do
     m="${m% (deleted)}"
@@ -243,15 +240,14 @@ if [ "$OS" = Linux ]; then
     base="${m##*/}"
     case "$base" in *.so|*.so.*) ;; *) continue ;; esac   # /dev/zero, shared memory, ...
     NSO=$((NSO + 1))
-    if [ "$LIBC" = gnu ] && [[ "$base" =~ $GLIBC_RT_RE ]]; then continue; fi
+    # Nothing from the host is allowed, libc included.
     printf 'disallowed runtime mapping: %s\n' "$m" >&2; RUNTIME_BAD=1
   done <<<"$MAPS"
   printf '%s\n' "$MAPS" | grep '/pg_clickhouse\.so$' >/dev/null || { echo "pg_clickhouse.so is not mapped" >&2; RUNTIME_BAD=1; }
   echo "shared objects mapped into the backend:"
   printf '%s\n' "$MAPS" | grep -E '\.so(\.[0-9.]+)?$' | sed "s|^$RP/|<bundle>/|; s|^$P/|<bundle>/|" | sed 's/^/  /'
   [ "$RUNTIME_BAD" = 0 ] || fail "a backend mapped shared objects from outside the bundle"
-  if [ "$LIBC" = musl ]; then ok "$NSO shared objects mapped, all from the bundle (no host libraries)"
-  else ok "$NSO shared objects mapped, all from the bundle or host glibc"; fi
+  ok "$NSO shared objects mapped, all from the bundle (no host libraries)"
 else
   step "5. runtime libraries (checked from DYLD_PRINT_LIBRARIES output in step 7)"
 fi
@@ -327,13 +323,8 @@ if [ "$OS" = Darwin ]; then
   find "$P/bin" "$P/lib" -type f -exec otool -L {} + 2>/dev/null | awk '/^\t/{print $1}' \
     | grep -v '^@rpath/' | sort | uniq -c | sort -rn
 else
-  MAX_GLIBC="${PGB_SELFTEST_MAX_GLIBC:-2.17}"
-  if [ "$LIBC" = musl ]; then
-    # Only the bundled musl (whose loader is also its libc) may be needed.
-    ALLOWED_RE='^libc\.musl-(x86_64|aarch64)\.so\.1$'
-  else
-    ALLOWED_RE='^(libc\.so\.6|libm\.so\.6|libpthread\.so\.0|libdl\.so\.2|librt\.so\.1|libutil\.so\.1|ld-linux-x86-64\.so\.2|ld-linux-aarch64\.so\.1)$'
-  fi
+  # Only the bundled musl (whose loader is also its libc) may be needed.
+  ALLOWED_RE='^libc\.musl-(x86_64|aarch64)\.so\.1$'
   HAVE_ELF_TOOLS=1
   if command -v readelf >/dev/null; then
     elf_needed() { readelf -d "$1" | sed -n 's/.*(NEEDED).*\[\(.*\)\]/\1/p'; }
@@ -385,29 +376,16 @@ else
     for rp in $(elf_rpath "$f" | tr ':' ' ' || true); do
       case "$rp" in '$ORIGIN'|'$ORIGIN/'*) ;; *) bad "$rel RPATH/RUNPATH $rp" ;; esac
     done
-    if [ "$LIBC" = gnu ] && command -v ldd >/dev/null; then
-      while read -r line; do
-        case "$line" in
-          *"not found"*) bad "$rel: $line" ;;
-          *"=> $P/"*|*"=> /lib"*|*"=> /usr/lib"*|linux-vdso*|*ld-linux*|/lib*|"") ;;
-          *"=>"*) bad "$rel resolves $line" ;;
-        esac
-      done < <(ldd "$f" 2>/dev/null | sed 's/^[[:space:]]*//' | grep -v 'statically linked' || true)
-    fi
     if command -v objdump >/dev/null; then
       v="$(objdump -T "$f" 2>/dev/null | grep -o 'GLIBC_[0-9][0-9.]*' | sed 's/GLIBC_//' | sort -t. -k1,1n -k2,2n | tail -1 || true)"
       if [ -n "$v" ] && [ "$(printf '%s\n%s\n' "$v" "$MAXGLIBC" | sort -t. -k1,1n -k2,2n | tail -1)" = "$v" ]; then MAXGLIBC="$v"; fi
     fi
   done < <(find "${ELF_DIRS[@]}" -type f -print0)
   if [ "$HAVE_ELF_TOOLS" = 0 ]; then
-    echo "SKIP: static ELF checks (NEEDED, RUNPATH, GLIBC_ versions) need readelf or objdump (binutils); runtime check in step 5 passed"
-  elif [ "$LIBC" = musl ]; then
+    echo "SKIP: static ELF checks (NEEDED, RUNPATH, GLIBC_ symbols) need readelf or objdump (binutils); runtime check in step 5 passed"
+  else
     [ "$MAXGLIBC" = 0.0 ] || bad "musl bundle references GLIBC_$MAXGLIBC symbols"
     echo "no GLIBC_ symbol versions referenced (musl bundle)"
-  elif [ "$MAXGLIBC" != 0.0 ]; then
-    echo "highest GLIBC symbol version required: $MAXGLIBC (ceiling $MAX_GLIBC)"
-    [ "$(printf '%s\n%s\n' "$MAXGLIBC" "$MAX_GLIBC" | sort -t. -k1,1n -k2,2n | tail -1)" = "$MAX_GLIBC" ] \
-      || bad "requires GLIBC_$MAXGLIBC (> $MAX_GLIBC baseline)"
   fi
   if [ "$HAVE_ELF_TOOLS" = 1 ]; then
     echo "NEEDED closure of all bundle ELF files:"

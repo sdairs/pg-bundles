@@ -14,10 +14,9 @@
 #   PGB_DIRTY=1        with PGB_COMMIT: mark the commit as having local changes
 #   PGB_REPO=<o/r>     repo recorded in BUNDLE.json (default: $GITHUB_REPOSITORY or sdairs/pg-bundles)
 #
-# Linux bundles are meant to be built inside a container via
-# scripts/build-linux.sh, which calls this script: manylinux2014 (glibc 2.17)
-# for *-unknown-linux-gnu, Alpine for *-unknown-linux-musl. On a musl host
-# (/lib/ld-musl-<arch>.so.1 exists) the target is *-unknown-linux-musl.
+# Linux bundles are *-unknown-linux-musl and must be built on a musl host
+# (/lib/ld-musl-<arch>.so.1 exists): use scripts/build-linux.sh, which runs
+# this script inside a pinned Alpine container.
 #
 # Layout of the cache (all under .build/, gitignored):
 #   .build/sources/                     verified source downloads, shared by all targets
@@ -42,8 +41,10 @@ OS="$(uname -s)"
 ARCH="$(uname -m)"
 LIBC=""
 if [ "$OS" = Linux ]; then
-  LIBC=gnu
-  [ -e "/lib/ld-musl-$ARCH.so.1" ] && LIBC=musl
+  # Only musl bundles are built (they run on glibc hosts too, see SPEC.md).
+  [ -e "/lib/ld-musl-$ARCH.so.1" ] \
+    || die "Linux bundles are built on a musl host; run scripts/build-linux.sh (Alpine container) instead"
+  LIBC=musl
 fi
 case "$OS/$ARCH" in
   Darwin/arm64)   TARGET=aarch64-apple-darwin ;;
@@ -406,12 +407,6 @@ check_elf_undefined() {
   done
 }
 
-# Highest GLIBC_x.y symbol version any bundled ELF file needs.
-max_glibc_symbol() {
-  find "$PKG/bin" "$PKG/lib" -type f -exec objdump -T {} + 2>/dev/null \
-    | grep -o 'GLIBC_[0-9][0-9.]*' | sed 's/GLIBC_//' | sort -t. -k1,1n -k2,2n -k3,3n | tail -1 || true
-}
-
 # musl: ship the build image's dynamic loader (which is also musl's libc) and
 # a launcher per executable.
 LDSO="ld-musl-$ARCH.so.1"
@@ -497,10 +492,7 @@ package() {
   repo="${PGB_REPO:-${GITHUB_REPOSITORY:-sdairs/pg-bundles}}"
   deps_json="\"openssl\": \"$OPENSSL_VERSION\", \"curl\": \"$CURL_VERSION\", \"lz4\": \"$LZ4_VERSION\", \"zstd\": \"$ZSTD_VERSION\""
   local platform_json
-  if [ "$LIBC" = gnu ]; then
-    deps_json="$deps_json, \"zlib\": \"$ZLIB_VERSION\", \"libedit\": \"$LIBEDIT_VERSION\", \"ncurses\": \"$NCURSES_VERSION\", \"libuuid\": \"util-linux $UTIL_LINUX_VERSION\""
-    platform_json="\"libc\": \"glibc\", \"min_glibc\": \"$(max_glibc_symbol)\""
-  elif [ "$LIBC" = musl ]; then
+  if [ "$LIBC" = musl ]; then
     deps_json="$deps_json, \"zlib\": \"$ZLIB_VERSION\", \"libedit\": \"$LIBEDIT_VERSION\", \"ncurses\": \"$NCURSES_VERSION\", \"libuuid\": \"util-linux $UTIL_LINUX_VERSION\", \"musl\": \"$MUSL_VERSION\""
     platform_json="\"libc\": \"musl\", \"bundled_loader\": \"lib/$LDSO\", \"host_libc\": [\"glibc\", \"musl\"]"
   else
@@ -522,7 +514,7 @@ EOF
   local tgz="$DIST/$NAME.tar.gz"
   rm -f "$tgz" "$tgz.sha256"
   if tar --version 2>/dev/null | grep 'GNU tar' >/dev/null; then
-    # Sorted member list (GNU tar 1.26 in CentOS 7 has no --sort=name).
+    # Sorted member list, without relying on GNU tar's --sort=name.
     (cd "$PKG_ROOT" && find "$NAME" -print0 | LC_ALL=C sort -z \
       | tar --owner=0 --group=0 --numeric-owner --no-recursion --null -T - -cf -) | gzip -9n >"$tgz"
   else

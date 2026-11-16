@@ -14,7 +14,7 @@
 #   PGB_DOCKER_NETWORK  docker --network value (default "host"; on Docker Desktop
 #                       use "container:<clickhouse container>" so 127.0.0.1 reaches it)
 #   PGB_DOCKER_PLATFORM docker --platform (default: from the bundle's target)
-#   CLICKHOUSE_*, PGB_SELFTEST_CLICKHOUSE, PGB_SELFTEST_MAX_GLIBC are passed to selftest.sh.
+#   CLICKHOUSE_*, PGB_SELFTEST_CLICKHOUSE are passed to selftest.sh.
 set -euo pipefail
 
 IMAGE="${1:?usage: selftest-container.sh <image> <bundle.tar.gz>}"
@@ -34,7 +34,7 @@ PLATFORM="${PGB_DOCKER_PLATFORM:-$PLATFORM}"
 # Values are passed through the environment and re-exported for the test user.
 ENV_ARGS=()
 for v in CLICKHOUSE_HOST CLICKHOUSE_HTTP_PORT CLICKHOUSE_NATIVE_PORT CLICKHOUSE_USER CLICKHOUSE_PASSWORD \
-         PGB_SELFTEST_CLICKHOUSE PGB_SELFTEST_MAX_GLIBC; do
+         PGB_SELFTEST_CLICKHOUSE; do
   [ -n "${!v+x}" ] && ENV_ARGS+=(-e "$v")
 done
 
