@@ -1,21 +1,42 @@
 name: build
 
 # Builds and self-tests every bundle. Runs for pushes to main, pull requests
-# and manual dispatch (build + test only), and for v* tags (build, test,
-# release).
+# and manual dispatch (build + test only), for v* tags (build, test, release),
+# and as a reusable workflow called by update.yml (scheduled rebuilds).
 on:
   push:
     branches: [main]
     tags: ["v*"]
   pull_request:
   workflow_dispatch:
+  workflow_call:
+    inputs:
+      ref:
+        description: Commit to build instead of the triggering ref.
+        type: string
+        default: ""
+      release_tag:
+        description: Release tag recorded in manifest.json (and created when publish is true).
+        type: string
+        default: ""
+      publish:
+        description: >-
+          After every self-test passed: fast-forward release_branch to ref,
+          then create the release_tag tag and GitHub release at ref.
+        type: boolean
+        default: false
+      release_branch:
+        description: Branch fast-forwarded to ref before the release is created.
+        type: string
+        default: ""
 
 permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+  # inputs.ref keeps a called run apart from a push/PR run of the same ref.
+  group: build-${{ github.ref }}-${{ inputs.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') && inputs.ref == '' }}
 
 jobs:
   linux:
@@ -60,6 +81,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ inputs.ref }}
           persist-credentials: false
 
       - name: Cache sources
@@ -116,6 +138,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ inputs.ref }}
           persist-credentials: false
 
       - name: Cache sources
@@ -170,10 +193,11 @@ jobs:
     runs-on: ubuntu-24.04
     env:
       # A real tag for a release; a placeholder otherwise.
-      RELEASE: ${{ (github.ref_type == 'tag' && github.ref_name) || 'v0.0.0-dev' }}
+      RELEASE: ${{ inputs.release_tag || (github.ref_type == 'tag' && github.ref_name) || 'v0.0.0-dev' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ inputs.ref }}
           persist-credentials: false
 
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
@@ -224,10 +248,11 @@ jobs:
           if-no-files-found: error
 
   release:
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/v') || inputs.publish
     needs: [manifest]
     runs-on: ubuntu-24.04
-    # contents: write creates the release. id-token and attestations sign the
+    # contents: write creates the release (and, for a scheduled rebuild, moves
+    # the branch and creates the tag). id-token and attestations sign the
     # build provenance attestation.
     permissions:
       contents: write
@@ -235,10 +260,12 @@ jobs:
       attestations: write
     env:
       GH_TOKEN: ${{ github.token }}
-      TAG: ${{ github.ref_name }}
+      TAG: ${{ inputs.release_tag || github.ref_name }}
+      RELEASE_BRANCH: ${{ inputs.release_branch }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ inputs.ref }}
           persist-credentials: false
 
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
@@ -265,9 +292,24 @@ jobs:
         with:
           subject-checksums: SHA256SUMS
 
+      # Scheduled rebuild: the commit that was built is not on the branch yet.
+      # Fast-forward only: if the branch moved meanwhile this fails, and
+      # nothing is tagged or released.
+      - name: Fast-forward ${{ inputs.release_branch }} to the built commit
+        if: inputs.publish && inputs.release_branch != ''
+        run: |
+          sha=$(git rev-parse HEAD)
+          gh api -X PATCH "repos/${GITHUB_REPOSITORY}/git/refs/heads/${RELEASE_BRANCH}" \
+            -f sha="$sha" -F force=false --jq .object.sha
+
       # gh uploads the assets to a draft and publishes it last, so
       # releases/latest never points at a release without its manifest.
       - name: Create release
         run: |
+          if [ "${GITHUB_REF_TYPE}" = tag ]; then
+            where=(--verify-tag)
+          else
+            where=(--target "$(git rev-parse HEAD)")
+          fi
           gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --title "$TAG" --notes-file dist/notes.md \
-            --verify-tag dist/*.tar.gz dist/*.tar.gz.sha256 dist/manifest.json
+            "${where[@]}" dist/*.tar.gz dist/*.tar.gz.sha256 dist/manifest.json

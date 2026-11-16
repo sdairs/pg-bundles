@@ -1,0 +1,137 @@
+name: update
+
+# Scheduled rebuilds: look for newer upstream releases of the sources pinned in
+# scripts/versions.env (scripts/check-updates.py). When something is newer,
+# commit the bump, build and self-test exactly that commit with build.yml, and
+# only if every self-test passed fast-forward main to it and publish the next
+# release. See "Scheduled rebuilds" in README.md.
+#
+# Nothing here relies on a push or pull request triggering another workflow:
+# refs written with GITHUB_TOKEN do not trigger workflows, so build.yml is
+# called directly (workflow_call) and does the release itself.
+on:
+  schedule:
+    - cron: "17 5 * * 1" # Mondays 05:17 UTC
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Build and self-test the bumped tree, but do not move the branch, tag or release.
+        type: boolean
+        default: true
+  # A pull request that touches the detection only runs the (read-only) check.
+  pull_request:
+    paths:
+      - scripts/check-updates.py
+      - .github/workflows/update.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: update
+  cancel-in-progress: false
+
+jobs:
+  detect:
+    name: Check upstream versions
+    runs-on: ubuntu-24.04
+    # contents: write pushes the candidate commit to a temporary branch.
+    permissions:
+      contents: write
+    outputs:
+      sha: ${{ steps.commit.outputs.sha }}
+      branch: ${{ steps.commit.outputs.branch }}
+      tag: ${{ steps.commit.outputs.tag }}
+      publish: ${{ steps.commit.outputs.publish }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Check for newer upstream releases
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          scripts/check-updates.py --write --summary "$RUNNER_TEMP/updates.txt" --github-output "$GITHUB_OUTPUT"
+          {
+            echo "### Upstream versions"
+            if [ -s "$RUNNER_TEMP/updates.txt" ]; then sed 's/^/- /' "$RUNNER_TEMP/updates.txt"; else echo "Everything pinned in scripts/versions.env is up to date."; fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          git diff
+
+      - name: Commit the bump to a temporary branch
+        id: commit
+        if: steps.check.outputs.changed == 'true' && github.event_name != 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}
+        run: |
+          # The next release tag: patch + 1 of the highest vX.Y.Z tag.
+          last=$(git ls-remote --tags --refs origin 'v*' | sed 's|.*refs/tags/||' \
+            | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1)
+          [ -n "$last" ] || { echo "error: no vX.Y.Z tag to count from" >&2; exit 1; }
+          tag="${last%.*}.$(( ${last##*.} + 1 ))"
+
+          # Only a run on main publishes; anything else is a dry run.
+          publish=false
+          if [ "$DRY_RUN" != true ] && [ "$GITHUB_REF" = refs/heads/main ]; then publish=true; fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          {
+            echo "Update pinned versions"
+            echo
+            cat "$RUNNER_TEMP/updates.txt"
+            echo
+            echo "Found by scripts/check-updates.py (run ${GITHUB_RUN_ID}); released as ${tag} once every self-test has passed."
+          } > "$RUNNER_TEMP/message.txt"
+          git commit -q -F "$RUNNER_TEMP/message.txt" scripts/versions.env
+          sha=$(git rev-parse HEAD)
+          branch="auto-update/${GITHUB_RUN_ID}"
+          git push "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "HEAD:refs/heads/${branch}"
+
+          {
+            echo "sha=$sha"
+            echo "branch=$branch"
+            echo "tag=$tag"
+            echo "publish=$publish"
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo
+            if [ "$publish" = true ]; then
+              echo "Building ${sha}; it becomes release ${tag} if every self-test passes."
+            else
+              echo "Dry run: building ${sha} (would be release ${tag}); nothing is moved, tagged or released."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  build:
+    name: Build
+    needs: detect
+    if: needs.detect.outputs.sha != ''
+    # The release job of build.yml needs these; they are only used when
+    # publish is true.
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    uses: ./.github/workflows/build.yml
+    with:
+      ref: ${{ needs.detect.outputs.sha }}
+      release_tag: ${{ needs.detect.outputs.tag }}
+      publish: ${{ needs.detect.outputs.publish == 'true' }}
+      release_branch: ${{ github.ref_name }}
+
+  cleanup:
+    name: Delete the temporary branch
+    needs: [detect, build]
+    if: always() && needs.detect.outputs.branch != ''
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH: ${{ needs.detect.outputs.branch }}
+        run: gh api -X DELETE "repos/${GITHUB_REPOSITORY}/git/refs/heads/${BRANCH}"
