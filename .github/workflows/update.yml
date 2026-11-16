@@ -134,4 +134,11 @@ jobs:
       - env:
           GH_TOKEN: ${{ github.token }}
           BRANCH: ${{ needs.detect.outputs.branch }}
-        run: gh api -X DELETE "repos/${GITHUB_REPOSITORY}/git/refs/heads/${BRANCH}"
+        # A re-run of failed jobs gets here again after the first attempt
+        # already deleted the branch (the commit stays fetchable by its sha).
+        run: |
+          if gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/${BRANCH}" >/dev/null 2>&1; then
+            gh api -X DELETE "repos/${GITHUB_REPOSITORY}/git/refs/heads/${BRANCH}"
+          else
+            echo "${BRANCH} is already gone"
+          fi

@@ -513,7 +513,9 @@ Refs written with the default `GITHUB_TOKEN` do not trigger other workflows,
 so the design does not depend on "open a pull request and let CI run": the
 scheduled run builds, tests and releases in one workflow run, and the bundles
 that were tested are the files that are released. If any self-test fails,
-`main` is untouched and nothing is tagged; the next run tries again. If
+`main` is untouched and nothing is tagged; the next run tries again (or use
+"Re-run failed jobs": the commit stays fetchable after its temporary branch
+is deleted). If
 `main` moved while the build ran, the fast-forward fails and nothing is
 released. The workflow token must be allowed to push to `main`: a branch
 rule that requires pull requests would block the fast-forward.
