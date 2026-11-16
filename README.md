@@ -392,3 +392,12 @@ https://github.com/sdairs/pg-bundles/releases/download/<tag>/pg-<pgversion>-pgch
   and Linux cross builds need emulation.
 - Build-recipe changes are not tracked by the step stamps; use `PGB_CLEAN=1`
   after editing `scripts/build.sh` (CI always builds from scratch).
+
+## Licence
+
+The build scripts, workflows and documentation in this repository are licensed
+under the [Apache License 2.0](LICENSE), the same licence as
+[clickhousectl](https://github.com/ClickHouse/clickhousectl). The bundles
+contain third-party software under its own licences (PostgreSQL, pg_clickhouse,
+OpenSSL, curl, lz4, zstd and, on Linux, zlib, libedit, ncurses, libuuid and
+musl); each bundle ships those licence texts in `share/licenses/`.
