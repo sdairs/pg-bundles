@@ -1,12 +1,15 @@
 # pg-bundles: portable Postgres + pg_clickhouse builds
 
-Status: **prototype** (v0.1.0 shipped PG 18 for four targets; this revision adds PG 17, musl/Alpine and
-lower OS baselines). This repo exists to answer one question for the wider team: *should ClickHouse
+Status: **prototype** (v0.1.0 shipped PG 18 for four targets; v0.2.0 added PG 17, musl/Alpine and lower
+OS baselines; this revision drops the glibc bundles and adds a release manifest, build provenance and
+scheduled rebuilds). This repo exists to answer one question for the wider team: *should ClickHouse
 publish its own portable Postgres binaries (with pg_clickhouse pre-installed) so that `clickhousectl`
 can run local Postgres without Docker?*
 
-Nothing here is published to `builds.clickhouse.com`. Hosting, ownership and signing are decisions for
-other teams; the prototype only has to make the case.
+Bundles are published as GitHub releases of this repo. The repo is expected to move to the ClickHouse
+organisation and publish to `builds.clickhouse.com`; it is built so that the move is a URL change (a
+manifest with relative file names, no repository name baked into the workflows; see README, "Moving the
+repository"). macOS signing and notarization remain decisions for other teams.
 
 ## Background
 
@@ -41,7 +44,8 @@ host packages.
 
 ### Non-goals
 
-- Publishing to `builds.clickhouse.com`, code signing/notarization, SBOMs, provenance beyond sha256.
+- Publishing to `builds.clickhouse.com` (not yet), macOS code signing/notarization, SBOMs. Releases do
+  carry sha256 files and GitHub build provenance attestations.
 - Windows. Extensions other than pg_clickhouse (pg_re2, pgvector, PostGIS come later, if ever).
 - Production use. Consequently out of scope: TLS to ClickHouse Cloud (works where the host's CA layout
   matches OpenSSL's compiled-in one, but is not tested or tuned) and PGXS/headers for building more
@@ -53,11 +57,13 @@ host packages.
 
 ### Versions
 
-- PostgreSQL majors **17** and **18**, latest minor of each (17.11 and 18.6 as of 2026-10-15). The major is a
+- PostgreSQL majors **17** and **18**, latest minor of each (17.12 and 18.7 as of 2026-11-16). The major is a
   build parameter (`PG_MAJOR=17|18`, default 18); `scripts/versions.env` pins version and sha256 per major.
-- pg_clickhouse: latest release tag (v0.11.0 as of 2026-10; requires PG ≥ 14). It builds with PGXS and has a
-  git submodule (`vendor/pg-clickhouse-c`, header-only), so clone with `--recurse-submodules` or use the
-  release zip.
+- pg_clickhouse: latest release (0.11.1 as of 2026-11; requires PG ≥ 14). It builds with PGXS and has a
+  git submodule (`vendor/pg-clickhouse-c`, header-only), so the build uses the PGXN distribution zip,
+  which includes it (the GitHub release usually carries the same zip, but v0.11.1 has no asset).
+- Versions move forward without a human: a scheduled workflow finds newer upstream releases, and
+  builds, tests and releases them (see [CI](#ci)).
 
 ### Targets
 
@@ -70,10 +76,8 @@ target.
 | `x86_64-apple-darwin` | macOS Intel runner | macOS 10.13+ |
 | `x86_64-unknown-linux-musl` | Alpine 3.24 container | **any** Linux, glibc or musl (Alpine); no host libraries |
 | `aarch64-unknown-linux-musl` | Alpine 3.24 container | **any** Linux, glibc or musl (Alpine); no host libraries |
-| `x86_64-unknown-linux-gnu` | manylinux2014 container (CentOS 7) | glibc 2.17+ (CentOS/RHEL 7+, Debian 8+, Ubuntu 14.04+) |
-| `aarch64-unknown-linux-gnu` | manylinux2014 container (CentOS 7) | glibc 2.17+ |
 
-Each target is built for both PostgreSQL majors: 12 bundles per release. The reasoning behind the Linux
+Each target is built for both PostgreSQL majors: 8 bundles per release. The reasoning behind the Linux
 and macOS baselines is in [Decisions: portability](#decisions-portability-2026-10-15).
 
 ### Naming
@@ -83,16 +87,17 @@ pg-<pgversion>-pgch-<pgchversion>-<target>.tar.gz
 pg-<pgversion>-pgch-<pgchversion>-<target>.tar.gz.sha256
 ```
 
-e.g. `pg-18.6-pgch-0.11.0-aarch64-apple-darwin.tar.gz`, `pg-17.11-pgch-0.11.0-x86_64-unknown-linux-musl.tar.gz`.
-The full PostgreSQL version carries the major (`18.6` → 18), so there is no separate major field in the name;
-`BUNDLE.json` has `postgres_version`.
+e.g. `pg-18.7-pgch-0.11.1-aarch64-apple-darwin.tar.gz`, `pg-17.12-pgch-0.11.1-x86_64-unknown-linux-musl.tar.gz`.
+The full PostgreSQL version carries the major (`18.7` → 18), so there is no separate major field in the name;
+`BUNDLE.json` has `postgres_version`. Names carry no build revision: a later release can publish the same
+name with different bytes (a dependency was bumped), so a client keys its cache on name and sha256.
 
 ### Layout
 
 The tarball has one top-level directory named like the archive (minus `.tar.gz`):
 
 ```
-pg-18.6-pgch-0.11.0-aarch64-apple-darwin/
+pg-18.7-pgch-0.11.1-aarch64-apple-darwin/
   bin/      postgres initdb pg_ctl psql pg_isready pg_dump pg_restore pg_config createdb …
   lib/      libpq.*, postgresql/*.so (incl. pg_clickhouse.so, contrib modules), any bundled dylibs/.so
   share/    postgresql/… (timezone data, extension/*.control + *.sql incl. pg_clickhouse)
@@ -105,14 +110,45 @@ pg-18.6-pgch-0.11.0-aarch64-apple-darwin/
 
 ```json
 {
-  "postgres_version": "18.6",
-  "extensions": { "pg_clickhouse": "0.11.0" },
+  "postgres_version": "18.7",
+  "extensions": { "pg_clickhouse": "0.11.1" },
   "target": "aarch64-apple-darwin",
-  "built_at": "2026-10-15T00:00:00Z",
+  "built_at": "2026-11-16T00:00:00Z",
   "source": { "repo": "sdairs/pg-bundles", "commit": "<sha>" },
   "configure": ["--with-openssl", "--without-icu", "..."]
 }
 ```
+
+### Release manifest
+
+Every release carries a `manifest.json` asset that lists its bundles, so `chctl` finds the bundle for its
+target and PostgreSQL major with one unauthenticated request to
+`https://github.com/sdairs/pg-bundles/releases/latest/download/manifest.json` and no GitHub API:
+
+```json
+{
+  "schema": 1,
+  "release": "v0.3.0",
+  "built_at": "2026-11-16T00:00:00Z",
+  "source": { "repo": "sdairs/pg-bundles", "commit": "<sha>" },
+  "bundles": [
+    {
+      "postgres_version": "18.7",
+      "postgres_major": "18",
+      "extensions": { "pg_clickhouse": "0.11.1" },
+      "target": "aarch64-apple-darwin",
+      "file": "pg-18.7-pgch-0.11.1-aarch64-apple-darwin.tar.gz",
+      "sha256": "<64 hex>",
+      "size": 11370169
+    }
+  ]
+}
+```
+
+`file` is relative to the manifest's own URL. There is exactly one bundle per `postgres_major` × `target`;
+`sha256` and `size` are of the tarball. The `.sha256` sidecars are still published. The release job
+generates the manifest from the built artifacts with `scripts/manifest.py`, and CI validates it on every
+run: every expected major × target present, versions as pinned, sha256 and size equal to the files.
 
 ### Build requirements
 
@@ -139,7 +175,8 @@ pg-18.6-pgch-0.11.0-aarch64-apple-darwin/
 
 ### Self-test (every bundle, in CI and locally)
 
-Run from an extracted copy in an unrelated temp directory, as a non-root user:
+Run from an extracted copy in an unrelated temp directory, as a non-root user (PostgreSQL refuses to
+run as root; see the root test below):
 
 1. `bin/initdb -D $TMP/data -U postgres --auth=scram-sha-256 --pwfile=<file> -E UTF8 --locale=C`
 2. `bin/postgres -D $TMP/data -p <free port> -k $TMP/sock -c listen_addresses=127.0.0.1` in the background;
@@ -152,12 +189,19 @@ Run from an extracted copy in an unrelated temp directory, as a non-root user:
    shared object comes from the bundle or the OS (Linux: the backend's `/proc/self/maps`, read with
    `pg_read_file`; for musl bundles nothing from the host at all. macOS: `DYLD_PRINT_LIBRARIES`).
 6. Stop with `bin/pg_ctl -D $TMP/data stop -m fast`.
-7. Assert the dependency closure (`otool -L` / `ldd` / `readelf -d`, or the bundled musl loader's `--list`)
-   contains only allowed system libraries, and the minimum OS (highest `GLIBC_` symbol version ≤ 2.17;
-   Mach-O minos ≤ `min_macos`) holds.
+7. Assert the dependency closure: macOS (`otool -L`) only system libraries and the bundle's own, Mach-O
+   minos ≤ `min_macos`; Linux (`readelf -d` and the bundled musl loader's `--list`) nothing outside the
+   bundle and no `GLIBC_` symbol versions.
 
 Linux bundles are also self-tested in other distro containers (`scripts/selftest-container.sh`):
-`centos:7` and `debian:10` for every Linux bundle, plus `alpine:3.24` for musl bundles.
+`alpine:3.24` (musl), `centos:7` (glibc 2.17) and `debian:10` (glibc 2.28), besides the Ubuntu 24.04 runner.
+
+**Root.** In the same containers, `scripts/selftest-root.sh` runs as root (the default user of
+`docker run`) and does what a root caller has to do: keep the bundle root-owned, pick an unprivileged
+user with an `/etc/passwd` entry (`nobody`, or a newly created system user), give it the instance
+directory, run `initdb` and `postgres` as that user, and use the client tools and signals as root. It
+runs two layouts: under root's home, which only works after `chmod o+x` on the 0700 home directory, and
+outside it. The recipe and the `/dev/shm` findings are in the README ("Running as root").
 
 Record bundle size (compressed and extracted) and time from extract to `pg_isready` success in the CI log
 and in the release notes.
@@ -167,11 +211,22 @@ and in the release notes.
 GitHub Actions in this repo:
 
 - Matrix over PG majors {17, 18} × targets; macOS arm64 on `macos-15`, macOS x86_64 on `macos-15-intel`,
-  Linux on `ubuntu-24.04` / `ubuntu-24.04-arm` running the build inside the manylinux2014 (gnu) or Alpine
-  (musl) container, then self-testing on the runner and in older/other distro containers (CentOS 7,
-  Debian 10, and Alpine for musl bundles).
-- Runs the self-test, then on a tag (`v*`) creates a GitHub release with every tarball + `.sha256`.
-- Pin actions to commit SHAs (same rule as clickhousectl).
+  Linux on `ubuntu-24.04` / `ubuntu-24.04-arm` running the build inside the Alpine container, then
+  self-testing on the runner and in other distro containers (Alpine, CentOS 7, Debian 10), as an
+  unprivileged user and as root.
+- Every run generates and validates `manifest.json` from the built artifacts.
+- On a tag (`v*`) it creates a GitHub release with every tarball + `.sha256` and `manifest.json`, and signs
+  a build provenance attestation for the tarballs (`actions/attest-build-provenance`, as clickhousectl's
+  release does; verify with `gh attestation verify <bundle> -R <repo>`).
+- **Scheduled rebuilds** (`update.yml`, weekly and on dispatch): `scripts/check-updates.py` looks for a
+  newer minor of each PostgreSQL major, a newer pg_clickhouse release and newer releases of the pinned
+  dependencies that have a reliable source (OpenSSL 3.5.x, curl, lz4, zstd, zlib, util-linux), verifying
+  each new tarball against the upstream-published hash. If anything is newer it commits the bump to a
+  temporary branch, calls `build.yml` for that commit, and only when every self-test has passed
+  fast-forwards `main` to it and publishes the next patch release. A push made with the default
+  `GITHUB_TOKEN` triggers no workflow, so nothing depends on a pull request's CI: one run builds, tests
+  and releases.
+- Pin actions to commit SHAs (same rule as clickhousectl), images by digest.
 
 Note: this repo is **public**, so release assets download without authentication, e.g.
 `https://github.com/sdairs/pg-bundles/releases/download/<tag>/<bundle>.tar.gz`. The `chctl` prototype should
@@ -179,22 +234,14 @@ still accept a local file as well as a URL (for testing unreleased builds).
 
 ## Decisions: portability (2026-10-15)
 
-### glibc baseline: 2.17 (manylinux2014)
+### No glibc bundles (2026-11-16)
 
-`*-unknown-linux-gnu` bundles are built in the PyPA `manylinux2014` images (CentOS 7, glibc 2.17,
-devtoolset-10 GCC 10), for both x86_64 and aarch64. glibc 2.17 is as far down as is practical:
-
-- It is the oldest glibc with a still-maintained build image for **both** architectures (PyPA still
-  publishes manylinux2014 images, with yum pointed at vault.centos.org). manylinux1/2010 (glibc 2.5/2.12)
-  are retired and x86_64-only; 2.17 is also the first glibc release with aarch64 support at all.
-- PostgreSQL 17/18 and every dependency build there unchanged; CentOS 7 has the flex (2.5.37) and bison
-  (3.0.4) PostgreSQL 17+ needs, and Perl 5.16 is enough for PostgreSQL and OpenSSL 3.5. The only build
-  change was dropping GNU tar's `--sort=name` (tar 1.26) for a sorted file list.
-- The self-test fails a bundle that needs any `GLIBC_` symbol version above 2.17
-  (`PGB_SELFTEST_MAX_GLIBC`, default 2.17) and runs every gnu bundle in `centos:7` and `debian:10`
-  containers as well as on Ubuntu 24.04.
-
-Anything older than glibc 2.17 is covered by the musl bundles below.
+v0.2.0 also shipped `*-unknown-linux-gnu` bundles, built in the PyPA `manylinux2014` images (CentOS 7,
+glibc 2.17). They are dropped: `chctl` only ever picks `<arch>-unknown-linux-musl`, which is its own
+target triple and runs on every glibc host as well (self-tested on glibc 2.17, 2.28 and 2.39), so the
+glibc bundles were four more builds per release that nothing downloaded. What a glibc build would give
+(glibc collations, NSS user lookup) does not matter for local development. `build.sh` now refuses a
+glibc host; the recipe is in the git history (v0.2.0) if it is ever wanted again.
 
 ### musl / Alpine: one bundle that runs on every Linux
 
@@ -220,7 +267,7 @@ considered:
 4. **Ship glibc instead** (its `ld-linux` + `libc.so.6` with the same launcher trick). Rejected: glibc is not
    designed to be relocated; NSS, iconv/gconv and locale data are loaded from fixed host paths and must
    match the libc version.
-5. **`gcompat` on Alpine** for the gnu bundles: a host package, and incomplete. Rejected.
+5. **glibc bundles plus `gcompat` on Alpine**: a host package, and incomplete. Rejected.
 
 Result: `<arch>-unknown-linux-musl` bundles run, self-tested with the pg_clickhouse foreign-table step, on
 Alpine 3.24 (musl 1.2.6), CentOS 7 (glibc 2.17), Debian 10 (glibc 2.28) and Ubuntu 24.04 (glibc 2.39). The
@@ -232,7 +279,7 @@ the bundle for its own target with no libc detection.
 
 Costs of the musl bundles, all acceptable for local development:
 
-- About 1 MiB larger compressed than the gnu bundle (loader, launcher, slightly larger OpenSSL).
+- About 1 MiB larger compressed than the glibc bundle was (loader, launcher, slightly larger OpenSSL).
 - `ps` shows the loader command line (`…/libexec/ld/postgres --library-path=… -- …/libexec/postgres -D …`)
   and PostgreSQL's process titles are squeezed into the `--argv0` value. `pgrep`/`pkill`/`top` show the
   right names.
@@ -241,9 +288,6 @@ Costs of the musl bundles, all acceptable for local development:
   directory-service (LDAP/sssd) user without a local passwd entry may fail `initdb`'s user lookup, and DNS
   uses `/etc/hosts` + `/etc/resolv.conf` only.
 - Running a `libexec/` binary directly does not work on a glibc host (always go through `bin/`).
-
-Both Linux flavours are kept: gnu bundles behave exactly like a distro (or the official Docker image)
-PostgreSQL on glibc hosts, including glibc collations, and musl bundles cover everything else.
 
 ### macOS: 11.0 (arm64), 10.13 (x86_64)
 
@@ -276,7 +320,8 @@ Behaviour of the native backend:
   detached, bound to `127.0.0.1` on the chosen port (reuse the existing port-selection logic), socket dir
   inside `.clickhouse/`, logs to a file in the instance dir. Record the pid in the same server metadata
   `local server list` already reads (`Engine::Postgres` exists in `src/local/server.rs`). Wait for readiness
-  with `pg_isready`. Refuse to start as root with a clear message (Postgres will not run as root).
+  with `pg_isready`. Postgres will not run as root: either refuse with a clear message, or drop
+  privileges as `scripts/selftest-root.sh` does (README, "Running as root").
 - **stop / remove**: SIGINT (Postgres "fast" shutdown) to the postmaster pid, wait, then mark stopped;
   `remove` deletes the data dir.
 - **client**: exec the bundled `psql` directly with the instance's connection settings.
@@ -292,7 +337,7 @@ Out of scope for the prototype: Docker→native migration, `--env` passthrough, 
 ```bash
 # Docker not running
 chctl local server start                       # local ClickHouse
-CLICKHOUSECTL_PG_RUNTIME=native CLICKHOUSECTL_PG_BUNDLE=file:///…/pg-18.6-pgch-0.11.0-aarch64-apple-darwin.tar.gz \
+CLICKHOUSECTL_PG_RUNTIME=native CLICKHOUSECTL_PG_BUNDLE=file:///…/pg-18.7-pgch-0.11.1-aarch64-apple-darwin.tar.gz \
   chctl local postgres start
 chctl local postgres client -q "CREATE EXTENSION pg_clickhouse; …query a ClickHouse table from Postgres…"
 chctl local postgres stop
@@ -302,9 +347,9 @@ The write-up compares Docker vs native: download size (`postgres:18` image vs bu
 `pg_isready` (cold and warm), and the steps a new user needs. It ends with the asks:
 
 1. Who owns building bundles long term (Postgres team, pg_clickhouse team, or clickhousectl)?
-2. Hosting: `builds.clickhouse.com/postgres/…` with a small `index.json` (major → latest bundle), or GitHub
-   releases on a ClickHouse-org repo?
-3. Signing/provenance: sha256 only, or GitHub artifact attestations / sigstore, plus macOS notarization?
+2. Hosting: `builds.clickhouse.com/postgres/…` or GitHub releases on a ClickHouse-org repo? Either way
+   the client starts from one `manifest.json` URL (done, see [Release manifest](#release-manifest)).
+3. Signing: sha256 files and GitHub artifact attestations are published; macOS notarization is open.
 4. Which extensions ship by default (pg_clickhouse only, or also pg_re2, pgvector, …) and which platforms.
 5. Does ClickHouse Cloud's managed Postgres already have a Postgres build pipeline worth reusing?
 
@@ -315,6 +360,9 @@ The write-up compares Docker vs native: download size (`postgres:18` image vs bu
 3. ~~GitHub Actions matrix + tagged release with assets~~ (done, v0.1.0).
 4. ~~PostgreSQL 17; glibc 2.17; musl bundles that run on any Linux; macOS 11.0/10.13~~ (done, see
    decisions above).
-5. `clickhousectl` draft branch with the native backend described above (ClickHouse/clickhousectl#1098):
-   pick the bundle by its own target triple (`*-unknown-linux-musl` on Linux), and the PG major.
-6. `DEMO.md` with measured numbers and the asks; share.
+5. ~~Licence, release manifest, build provenance, scheduled rebuilds, a root test; glibc bundles
+   dropped~~ (done, this revision).
+6. `clickhousectl` draft branch with the native backend described above (ClickHouse/clickhousectl#1098):
+   pick the bundle from `manifest.json` by its own target triple (`*-unknown-linux-musl` on Linux) and
+   the PG major.
+7. `DEMO.md` with measured numbers and the asks; share.
