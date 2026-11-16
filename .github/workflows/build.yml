@@ -1,49 +1,71 @@
 name: build
 
+# Builds and self-tests every bundle. Runs for pushes to main, pull requests
+# and manual dispatch (build + test only), for v* tags (build, test, release),
+# and as a reusable workflow called by update.yml (scheduled rebuilds).
 on:
   push:
     branches: [main]
     tags: ["v*"]
   pull_request:
   workflow_dispatch:
+  workflow_call:
+    inputs:
+      ref:
+        description: Commit to build instead of the triggering ref.
+        type: string
+        default: ""
+      release_tag:
+        description: Release tag recorded in manifest.json (and created when publish is true).
+        type: string
+        default: ""
+      publish:
+        description: >-
+          After every self-test passed: fast-forward release_branch to ref,
+          then create the release_tag tag and GitHub release at ref.
+        type: boolean
+        default: false
+      release_branch:
+        description: Branch fast-forwarded to ref before the release is created.
+        type: string
+        default: ""
 
 permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+  # inputs.ref keeps a called run apart from a push/PR run of the same ref.
+  group: build-${{ github.ref }}-${{ inputs.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') && inputs.ref == '' }}
 
 jobs:
   linux:
-    name: pg${{ matrix.pg }} ${{ matrix.arch }}-unknown-linux-${{ matrix.libc }}
+    name: pg${{ matrix.pg }} ${{ matrix.arch }}-unknown-linux-musl
     strategy:
       fail-fast: false
       matrix:
         pg: ["17", "18"]
         arch: [x86_64, aarch64]
-        libc: [gnu, musl]
         include:
           - arch: x86_64
             runner: ubuntu-24.04
           - arch: aarch64
             runner: ubuntu-24.04-arm
-          # Extra distros the bundle is self-tested in (besides the Ubuntu 24.04
-          # runner): the oldest glibc we support, and for musl bundles Alpine.
-          - libc: gnu
-            distros: >-
-              centos:7@sha256:be65f488b7764ad3638f236b7b515b3678369a5124c47b8d32916d6487418ea4
-              debian:10@sha256:58ce6f1271ae1c8a2006ff7d3e54e9874d839f573d8009c20154ad0f2fb0a225
-          - libc: musl
-            distros: >-
-              alpine:3.24.2@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6
-              centos:7@sha256:be65f488b7764ad3638f236b7b515b3678369a5124c47b8d32916d6487418ea4
-              debian:10@sha256:58ce6f1271ae1c8a2006ff7d3e54e9874d839f573d8009c20154ad0f2fb0a225
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     env:
-      TARGET: ${{ matrix.arch }}-unknown-linux-${{ matrix.libc }}
+      TARGET: ${{ matrix.arch }}-unknown-linux-musl
       PG_MAJOR: ${{ matrix.pg }}
+      # Distros the bundle is self-tested in, besides the Ubuntu 24.04 runner:
+      # musl (Alpine) and old and current glibc.
+      DISTROS: >-
+        alpine:3.24.2@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6
+        centos:7@sha256:be65f488b7764ad3638f236b7b515b3678369a5124c47b8d32916d6487418ea4
+        debian:10@sha256:58ce6f1271ae1c8a2006ff7d3e54e9874d839f573d8009c20154ad0f2fb0a225
+      CLICKHOUSE_HOST: 127.0.0.1
+      CLICKHOUSE_HTTP_PORT: "8123"
+      CLICKHOUSE_NATIVE_PORT: "9000"
+      PGB_SELFTEST_CLICKHOUSE: require
     services:
       clickhouse:
         image: clickhouse/clickhouse-server:26.8@sha256:bc1a1d93355508c1414bb692e6e56972b492dad55a7891cb63c6e6f1b9697236
@@ -59,42 +81,43 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ inputs.ref }}
           persist-credentials: false
 
       - name: Cache sources
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: .build/sources
-          key: sources-pg${{ matrix.pg }}-${{ matrix.libc }}-${{ hashFiles('scripts/versions.env') }}
+          key: sources-pg${{ matrix.pg }}-musl-${{ hashFiles('scripts/versions.env') }}
           restore-keys: |
+            sources-pg${{ matrix.pg }}-musl-
             sources-
 
-      - name: Build (manylinux2014 for gnu, Alpine for musl)
-        run: scripts/build-linux.sh "${{ matrix.arch }}" "${{ matrix.libc }}"
+      - name: Build (Alpine container)
+        run: scripts/build-linux.sh "${{ matrix.arch }}"
 
       - name: Self-test (runner, Ubuntu 24.04, ClickHouse service container)
-        env:
-          CLICKHOUSE_HOST: 127.0.0.1
-          CLICKHOUSE_HTTP_PORT: "8123"
-          CLICKHOUSE_NATIVE_PORT: "9000"
-          PGB_SELFTEST_CLICKHOUSE: require
         run: |
           tgz=$(ls dist/*-"$TARGET".tar.gz)
           PGB_SELFTEST_REPORT="${tgz%.tar.gz}.selftest.json" scripts/selftest.sh "$tgz" | tee selftest.log
           { echo "### pg${PG_MAJOR} ${TARGET} on the runner"; echo '```'; sed -n '/^--- summary/,$p' selftest.log; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Self-test in other distros
-        env:
-          CLICKHOUSE_HOST: 127.0.0.1
-          CLICKHOUSE_HTTP_PORT: "8123"
-          CLICKHOUSE_NATIVE_PORT: "9000"
-          PGB_SELFTEST_CLICKHOUSE: require
-          DISTROS: ${{ matrix.distros }}
+      - name: Self-test in other distros (unprivileged user)
         run: |
           tgz=$(ls dist/*-"$TARGET".tar.gz)
           for image in $DISTROS; do
             scripts/selftest-container.sh "$image" "$tgz" | tee selftest-distro.log
             { echo "### pg${PG_MAJOR} ${TARGET} in ${image%@*}"; echo '```'; sed -n '/^--- summary/,$p' selftest-distro.log; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          done
+
+      # `docker run` starts as root by default, and PostgreSQL refuses to run
+      # as root: scripts/selftest-root.sh shows what a caller has to do there.
+      - name: Self-test where the invoking user is root
+        run: |
+          tgz=$(ls dist/*-"$TARGET".tar.gz)
+          for image in $DISTROS; do
+            PGB_CONTAINER_USER=root scripts/selftest-container.sh "$image" "$tgz" | tee selftest-root.log
+            { echo "### pg${PG_MAJOR} ${TARGET} as root in ${image%@*}"; echo '```'; sed -n '/^--- summary/,$p' selftest-root.log; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
           done
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -126,6 +149,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ inputs.ref }}
           persist-credentials: false
 
       - name: Cache sources
@@ -134,6 +158,7 @@ jobs:
           path: .build/sources
           key: sources-pg${{ matrix.pg }}-macos-${{ hashFiles('scripts/versions.env') }}
           restore-keys: |
+            sources-pg${{ matrix.pg }}-macos-
             sources-
 
       - name: Build
@@ -171,15 +196,20 @@ jobs:
             dist/*.selftest.json
           if-no-files-found: error
 
-  release:
-    if: startsWith(github.ref, 'refs/tags/v')
+  # Runs on every build, so the manifest a release would publish is generated
+  # and validated for pull requests too. Needs every bundle job to have passed
+  # its self-tests.
+  manifest:
+    name: manifest.json
     needs: [linux, macos]
     runs-on: ubuntu-24.04
-    permissions:
-      contents: write
+    env:
+      # A real tag for a release; a placeholder otherwise.
+      RELEASE: ${{ inputs.release_tag || (github.ref_type == 'tag' && github.ref_name) || 'v0.0.0-dev' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ inputs.ref }}
           persist-credentials: false
 
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
@@ -188,31 +218,27 @@ jobs:
           path: dist
           merge-multiple: true
 
-      - name: Check every bundle is present
+      # Fails unless every PostgreSQL major x target bundle is present with
+      # the versions pinned in versions.env, was built from this commit, and
+      # its sha256 and size match the manifest and its .sha256 file.
+      - name: Generate and validate manifest.json
         run: |
-          . scripts/versions.env
-          missing=0
-          for major in $PG_MAJORS; do
-            v="PG${major}_VERSION"
-            for t in aarch64-apple-darwin x86_64-apple-darwin \
-                     x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu \
-                     x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
-              f="dist/pg-${!v}-pgch-${PGCH_VERSION}-$t.tar.gz"
-              for g in "$f" "$f.sha256"; do [ -f "$g" ] || { echo "missing $g"; missing=1; }; done
-            done
-          done
           ls -l dist
-          exit "$missing"
+          scripts/manifest.py generate --release "$RELEASE" --dist dist --commit "$(git rev-parse HEAD)"
+          scripts/manifest.py validate --dist dist --release "$RELEASE" --check-source
+          cat dist/manifest.json
+          { echo "### manifest.json"; echo '```json'; cat dist/manifest.json; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Release notes
         run: |
           . scripts/versions.env
           {
-            echo "PostgreSQL ${PG17_VERSION} and ${PG18_VERSION} with pg_clickhouse ${PGCH_VERSION}, built from ${GITHUB_SHA}."
+            echo "PostgreSQL $(jq -r '[.bundles[].postgres_version] | unique | join(" and ")' dist/manifest.json) with pg_clickhouse ${PGCH_VERSION}, built from $(jq -r .source.commit dist/manifest.json)."
             echo
             echo "OpenSSL ${OPENSSL_VERSION}, curl ${CURL_VERSION}, lz4 ${LZ4_VERSION}, zstd ${ZSTD_VERSION}."
-            echo "\`*-unknown-linux-gnu\` bundles need glibc 2.17+. \`*-unknown-linux-musl\` bundles carry their own musl ${MUSL_VERSION} loader and run on any Linux, glibc or musl (Alpine)."
+            echo "\`*-unknown-linux-musl\` bundles carry their own musl ${MUSL_VERSION} loader and run on any Linux, glibc or musl (Alpine)."
             echo "macOS bundles need macOS 11.0+ (Apple silicon) or 10.13+ (Intel)."
+            echo "\`manifest.json\` lists every bundle with its sha256 and size."
             echo "Self-test timings were measured on GitHub-hosted runners (extract, initdb, start, wait for pg_isready)."
             echo
             echo "| Bundle | Compressed | Extracted | Extract to pg_isready | Start to pg_isready | ClickHouse query |"
@@ -221,14 +247,81 @@ jobs:
               jq -r '"| `\(.bundle)` | \(.compressed_bytes/1048576*10|round/10) MiB | \(.extracted_bytes/1048576*10|round/10) MiB | \(.extract_to_ready_ms) ms | \(.start_ms) ms | \(.clickhouse) |"' "$f"
             done
             echo
-            echo "Verify a download with \`shasum -a 256 -c <bundle>.tar.gz.sha256\`."
-          } > notes.md
-          cat notes.md
+            echo "Verify a download with \`shasum -a 256 -c <bundle>.tar.gz.sha256\`, and its build provenance with \`gh attestation verify <bundle>.tar.gz -R ${GITHUB_REPOSITORY}\`."
+          } > dist/notes.md
+          cat dist/notes.md
 
-      - name: Create release
-        env:
-          GH_TOKEN: ${{ github.token }}
-          TAG: ${{ github.ref_name }}
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-manifest
+          path: |
+            dist/manifest.json
+            dist/notes.md
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v') || inputs.publish
+    needs: [manifest]
+    runs-on: ubuntu-24.04
+    # contents: write creates the release (and, for a scheduled rebuild, moves
+    # the branch and creates the tag). id-token and attestations sign the
+    # build provenance attestation.
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ inputs.release_tag || github.ref_name }}
+      RELEASE_BRANCH: ${{ inputs.release_branch }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: bundle-*
+          path: dist
+          merge-multiple: true
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-manifest
+          path: dist
+
+      # The files about to be published are the ones the manifest job checked.
+      - name: Validate manifest.json again
         run: |
-          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --title "$TAG" --notes-file notes.md \
-            dist/*.tar.gz dist/*.tar.gz.sha256
+          scripts/manifest.py validate --dist dist --release "$TAG" --check-source
+          cat dist/*.tar.gz.sha256 > SHA256SUMS
+          cat SHA256SUMS
+
+      # Verifiable with `gh attestation verify <bundle>.tar.gz -R <repo>`.
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-checksums: SHA256SUMS
+
+      # Scheduled rebuild: the commit that was built is not on the branch yet.
+      # Fast-forward only: if the branch moved meanwhile this fails, and
+      # nothing is tagged or released.
+      - name: Fast-forward ${{ inputs.release_branch }} to the built commit
+        if: inputs.publish && inputs.release_branch != ''
+        run: |
+          sha=$(git rev-parse HEAD)
+          gh api -X PATCH "repos/${GITHUB_REPOSITORY}/git/refs/heads/${RELEASE_BRANCH}" \
+            -f sha="$sha" -F force=false --jq .object.sha
+
+      # gh uploads the assets to a draft and publishes it last, so
+      # releases/latest never points at a release without its manifest.
+      - name: Create release
+        run: |
+          if [ "${GITHUB_REF_TYPE}" = tag ]; then
+            where=(--verify-tag)
+          else
+            where=(--target "$(git rev-parse HEAD)")
+          fi
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --title "$TAG" --notes-file dist/notes.md \
+            "${where[@]}" dist/*.tar.gz dist/*.tar.gz.sha256 dist/manifest.json
