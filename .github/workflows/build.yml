@@ -101,12 +101,22 @@ jobs:
           PGB_SELFTEST_REPORT="${tgz%.tar.gz}.selftest.json" scripts/selftest.sh "$tgz" | tee selftest.log
           { echo "### pg${PG_MAJOR} ${TARGET} on the runner"; echo '```'; sed -n '/^--- summary/,$p' selftest.log; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Self-test in other distros
+      - name: Self-test in other distros (unprivileged user)
         run: |
           tgz=$(ls dist/*-"$TARGET".tar.gz)
           for image in $DISTROS; do
             scripts/selftest-container.sh "$image" "$tgz" | tee selftest-distro.log
             { echo "### pg${PG_MAJOR} ${TARGET} in ${image%@*}"; echo '```'; sed -n '/^--- summary/,$p' selftest-distro.log; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          done
+
+      # `docker run` starts as root by default, and PostgreSQL refuses to run
+      # as root: scripts/selftest-root.sh shows what a caller has to do there.
+      - name: Self-test where the invoking user is root
+        run: |
+          tgz=$(ls dist/*-"$TARGET".tar.gz)
+          for image in $DISTROS; do
+            PGB_CONTAINER_USER=root scripts/selftest-container.sh "$image" "$tgz" | tee selftest-root.log
+            { echo "### pg${PG_MAJOR} ${TARGET} as root in ${image%@*}"; echo '```'; sed -n '/^--- summary/,$p' selftest-root.log; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
           done
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

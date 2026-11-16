@@ -51,7 +51,7 @@ ok()   { printf 'ok: %s\n' "$*"; }
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 
 if [ "$(id -u)" = 0 ]; then
-  fail "run the self-test as a non-root user (postgres refuses to run as root)"
+  fail "run the self-test as a non-root user (postgres refuses to run as root); scripts/selftest-root.sh covers a root caller"
 fi
 
 now_ms() {
